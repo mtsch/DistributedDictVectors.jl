@@ -1,0 +1,10 @@
+name = "DistributedDictVectors"
+uuid = "e7928752-619f-4675-a85a-eefe80cb0a68"
+authors = ["mtsch <matijacufar@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+Folds = "41a02a25-b8f0-4f67-bc48-60067656b558"
+KrylovKit = "0b1a1467-8014-51b9-945f-bf0ae24f4b77"
+MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+Rimu = "c53c40cc-bd84-11e9-2cf4-a9fde2b9386e"
