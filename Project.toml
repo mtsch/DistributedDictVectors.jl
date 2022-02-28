@@ -1,5 +1,5 @@
 name = "DistributedDictVectors"
-uuid = "e7928752-619f-4675-a85a-eefe80cb0a68"
+uuid = "d64a438d-633e-4f70-a2fb-b12b87391165"
 authors = ["mtsch <matijacufar@gmail.com>"]
 version = "0.1.0"
 
