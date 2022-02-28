@@ -1,4 +1,4 @@
-module DistributedVectors
+module DistributedDictVectors
 
 using Rimu
 using MPI
