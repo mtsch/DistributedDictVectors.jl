@@ -53,8 +53,11 @@ Base.isempty(dv::Storage) = isempty(dv.next)
 Rimu.storage(dv::Storage) = dv
 Rimu.capacity(dv::Storage) = length(dv.pointers)
 Base.keytype(::Type{<:Storage{K}}) where {K} = K
+Base.keytype(::Storage{K}) where {K} = K
 Base.valtype(::Type{<:Storage{<:Any,V}}) where {V} = V
+Base.valtype(::Storage{<:Any,V}) where {V} = V
 Base.eltype(::Type{<:Storage{K,V}}) where {K,V} = Pair{K,V}
+Base.eltype(::Storage{K,V}) where {K,V} = Pair{K,V}
 indextype(::Type{<:Storage{<:Any,<:Any,T}}) where {T} = T
 indextype(dv) = indextype(typeof(dv))
 
@@ -340,7 +343,7 @@ end
 
 """
     map!(f, values(dv::Storage))
-    map!(f, pairs(dv::Storage))
+    map!(f, dst::Storage, values(src::Storage))
 
 Apply function to all values in `dv`.
 When mapping over `pairs`, the function should return the value type.
@@ -359,24 +362,23 @@ function Base.map!(f, vs::StorageValues)
         end
     end
 end
-function Base.map!(f, ps::StoragePairs)
-    dv = ps.dvec
-    # Iterating in reverse order makes sure replacement had f already applied when deleting.
-    @inbounds for i in length(dv.pairs):-1:1
-        k, v = dv.pairs[i]
-        v = f(k => v)
-        if iszero(v)
-            t = get_token_by_index(dv, i)
-            delete!(dv, t)
-        else
-            dv.pairs[i] = k => v
+function Base.map!(f, dst::Storage, vs::StorageValues)
+    src = vs.dvec
+    if src === dst
+        map!(f, vs)
+    else
+        empty!(dst)
+        @inbounds for i in length(src.pairs):-1:1
+            k, v = src.pairs[i]
+            dst[k] = f(v)
         end
     end
+    return dst
 end
 
-function Rimu.add!(dst::Storage, src::Storage)
+function Rimu.add!(dst::Storage, src::Storage, α=one(valtype(src)))
     for (k, v) in pairs(src)
-        deposit!(dst, k, v)
+        deposit!(dst, k, v * α)
     end
     return dst
 end

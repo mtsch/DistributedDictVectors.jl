@@ -4,6 +4,7 @@ using Rimu
 using MPI
 using Folds
 using KrylovKit
+using LinearAlgebra
 
 include("storage.jl")
 include("tvec.jl")

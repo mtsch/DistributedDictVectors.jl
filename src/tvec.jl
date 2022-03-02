@@ -32,6 +32,14 @@ num_segments(t) = length(t.segments)
 Base.length(s::TVec) = sum(length, s.segments)
 Rimu.StochasticStyle(s::TVec) = s.style
 
+function Base.copyto!(dst::TVec, src::TVec)
+    if num_segments(dst) == num_segments(src)
+        map!(identity, dst, values(src))
+    else
+        return invoke(copyto!, Tuple{AbstractDVec, TVec}, dst, src)
+    end
+end
+
 # Get and set
 function target_segment(t, h)
     is_distributed(t) && throw(ArgumentError(
@@ -124,4 +132,48 @@ function Base.map!(f, s::TVecIterator{typeof(values)})
     end
     return s
 end
-# TODO: multi-argument map!
+function Base.map!(f, dst::AbstractDVec, src::TVecIterator{typeof(values)})
+    @assert length(dst.segments) == length(src.segments)
+    Folds.foreach(zip(dst.segments, src.segments)) do (dst_s, src_s)
+        map!(f, dst_s, values(src_s))
+    end
+    return dst
+end
+
+function Base.:*(α::Number, dv::TVec)
+    T = promote_type(typeof(α), valtype(dv))
+    if T == valtype(dv)
+        if iszero(α)
+            result = similar(dv)
+        else
+            result = copy(dv)
+            map!(x -> α*x, values(dv))
+        end
+    else
+        result = similar(dv, T)
+        if !iszero(α)
+            map!(x -> α * x, result, values(dv))
+        end
+    end
+    return result
+end
+
+function LinearAlgebra.rmul!(dv::TVec, α::Number)
+    map!(x -> x * α, values(dv))
+    return dv
+end
+
+function LinearAlgebra.mul!(dst::TVec, src::TVec, α::Number)
+    return map!(x -> α * x, dst, values(src))
+end
+
+function LinearAlgebra.axpby!(α, v::TVec, β::Number, w::TVec)
+    rmul!(w, β)
+    axpy!(α, v, w)
+end
+function LinearAlgebra.axpy!(α, v::TVec, w::TVec)
+    foreach(zip(w.segments, v.segments)) do (w_s, v_s)
+        add!(w_s, v_s, α)
+    end
+    return w
+end
