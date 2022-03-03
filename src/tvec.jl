@@ -122,8 +122,8 @@ Base.keys(s::TVec) = TVecIterator(keys, s.segments)
 Base.pairs(s::TVec) = TVecIterator(pairs, s.segments)
 
 function Base.mapreduce(f, op, s::TVecIterator; kwargs...)
-    return Folds.mapreduce(op, s.segments) do v
-        mapreduce(f, op, s.fun(v))
+    return Folds.mapreduce(op, s.segments; kwargs...) do v
+        mapreduce(f, op, s.fun(v); kwargs...)
     end
 end
 function Base.map!(f, s::TVecIterator{typeof(values)})
@@ -162,7 +162,6 @@ function LinearAlgebra.rmul!(dv::TVec, α::Number)
     map!(x -> x * α, values(dv))
     return dv
 end
-
 function LinearAlgebra.mul!(dst::TVec, src::TVec, α::Number)
     return map!(x -> α * x, dst, values(src))
 end
@@ -176,4 +175,14 @@ function LinearAlgebra.axpy!(α, v::TVec, w::TVec)
         add!(w_s, v_s, α)
     end
     return w
+end
+function LinearAlgebra.dot(v::TVec, w::TVec)
+    T = promote_type(valtype(v), valtype(w))
+    if num_segments(v) == num_segments(w)
+        return sum(pairs(v); init=zero(T)) do (key, val)
+            w[key] * val
+        end
+    else
+        return invoke(dot, Tuple{AbstractDVec,AbstractDVec}, v, w)
+    end
 end
