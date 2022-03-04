@@ -89,12 +89,12 @@ function Base.empty(s::TVec, ::Type{K}, ::Type{V}; style=s.style) where {K,V}
 end
 
 function Base.empty!(s::TVec)
-    foreach(empty!, s.segments)
+    Folds.foreach(empty!, s.segments)
     return s
 end
 function Base.sizehint!(s::TVec, n)
     n_per_segment = cld(n, length(s.segments))
-    foreach(d -> sizehint!(d, n_per_segment), s.segments)
+    Folds.foreach(d -> sizehint!(d, n_per_segment), s.segments)
     return s
 end
 

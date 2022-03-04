@@ -7,16 +7,12 @@ end
 Base.eltype(::EquippedOperator{O}) where {O} = eltype(O)
 Base.eltype(::Type{<:EquippedOperator{O}}) where {O} = eltype(O)
 
-function equip(operator; num_segments=4, style=default_style(eltype(operator)))
-    T = eltype(operator)
-    vector = TVec(starting_address(operator) => one(T); num_segments, style)
-
-    return equip(operator, vector)
-end
-
 function equip(operator, vector)
-    @assert eltype(operator) == valtype(vector)
-    wm = WorkingMemory(vector)
+    if eltype(operator) === valtype(vector)
+        wm = WorkingMemory(vector)
+    else
+        wm = WorkingMemory(similar(vector, eltype(operator)))
+    end
     return EquippedOperator(operator, wm)
 end
 
@@ -34,6 +30,6 @@ function KrylovKit.eigsolve(
     verbosity=0,
     kwargs...
 )
-    eo = equip(ham)
+    eo = equip(ham, dv)
     return eigsolve(eo, dv, howmany, which; issymmetric, verbosity, kwargs...)
 end
