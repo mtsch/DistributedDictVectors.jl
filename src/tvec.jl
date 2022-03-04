@@ -34,10 +34,19 @@ Rimu.StochasticStyle(s::TVec) = s.style
 
 function Base.copyto!(dst::TVec, src::TVec)
     if num_segments(dst) == num_segments(src)
-        map!(identity, dst, values(src))
+        Folds.foreach(enumerate(src.segments)) do (i, s_s)
+            copy!(dst.segments[i], s_s)
+        end
+        return dst
     else
         return invoke(copyto!, Tuple{AbstractDVec, TVec}, dst, src)
     end
+end
+function Base.copy!(dst::TVec, src::TVec)
+    return copyto!(dst, src)
+end
+function Base.copy(dst::TVec, src::TVec)
+    return copy!(empty(dst), src)
 end
 
 # Get and set
@@ -153,7 +162,7 @@ function Base.:*(α::Number, dv::TVec)
             result = similar(dv)
         else
             result = copy(dv)
-            map!(x -> α*x, values(dv))
+            map!(x -> α * x, result, values(dv))
         end
     else
         result = similar(dv, T)
@@ -177,15 +186,15 @@ function LinearAlgebra.axpby!(α, v::TVec, β::Number, w::TVec)
     axpy!(α, v, w)
 end
 function LinearAlgebra.axpy!(α, v::TVec, w::TVec)
-    foreach(zip(w.segments, v.segments)) do (w_s, v_s)
+    Folds.foreach(zip(w.segments, v.segments)) do (w_s, v_s)
         add!(w_s, v_s, α)
     end
     return w
 end
 function LinearAlgebra.dot(v::TVec, w::TVec)
     T = promote_type(valtype(v), valtype(w))
-    return sum(pairs(v); init=zero(T)) do (key, val)
-        conj(val) * w[key]
+    return Folds.sum(zip(v.segments, w.segments)) do (v_s, w_s)
+        dot(v_s, w_s)
     end::T
 end
 function Base.real(v::TVec)

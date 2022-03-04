@@ -382,3 +382,11 @@ function Rimu.add!(dst::Storage, src::Storage, α=one(valtype(src)))
     end
     return dst
 end
+
+function LinearAlgebra.dot(v::Storage, w::Storage)
+    result = zero(promote_type(valtype(v), valtype(w)))
+    for (key, val) in pairs(v)
+        result += conj(val) * w[key]
+    end
+    return result
+end

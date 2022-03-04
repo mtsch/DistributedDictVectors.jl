@@ -29,10 +29,11 @@ end
 
 function KrylovKit.eigsolve(
     ham::AbstractHamiltonian, dv::TVec, howmany::Int, which::Symbol=:SR;
-    issymmetric = eltype(ham) <: Real && LOStructure(ham) === IsHermitian(),
-    ishermitian = LOStructure(ham) === IsHermitian(),
+    issymmetric=eltype(ham) <: Real && LOStructure(ham) === IsHermitian(),
+    ishermitian=LOStructure(ham) === IsHermitian(),
+    verbosity=0,
     kwargs...
 )
     eo = equip(ham)
-    eigsolve(eo, dv, howmany, which; issymmetric, kwargs...)
+    return eigsolve(eo, dv, howmany, which; issymmetric, verbosity, kwargs...)
 end
