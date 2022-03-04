@@ -63,7 +63,7 @@ end
 function Rimu.deposit!(t::TVec{K,V}, key::K, val, parent) where {K,V}
     h = hash(key)
     seg = t.segments[target_segment(t, h)]
-    return deposit!(seg, V(val), key, h, parent)
+    return deposit!(seg, key, V(val), h, parent)
 end
 
 ###
@@ -92,10 +92,19 @@ end
 ###
 ### Iterators and parallel reduction
 ###
-struct TVecIterator{F,V}
+struct TVecIterator{F,V,T}
     fun::F
     segments::V
+
+    function TVecIterator(fun::F, ::Type{T}, tv::TVec) where {F,T}
+        return new{F,typeof(tv.segments),T}(fun, tv.segments)
+    end
 end
+Base.values(s::TVec) = TVecIterator(values, valtype(s), s)
+Base.keys(s::TVec) = TVecIterator(keys, keytype(s), s)
+Base.pairs(s::TVec) = TVecIterator(pairs, eltype(s), s)
+
+Base.eltype(s::Type{<:TVecIterator{<:Any,<:Any,T}}) where {T} = T
 Base.length(s::TVecIterator) = sum(length, s.segments)
 function Base.iterate(s::TVecIterator, i::Int=1)
     @warn "Iteration is unsupported. Please use `map`, `mapreduce`, etc..." maxlog=1
@@ -117,9 +126,6 @@ function Base.iterate(s::TVecIterator, (i, st))
         return it[1], (i, it[2])
     end
 end
-Base.values(s::TVec) = TVecIterator(values, s.segments)
-Base.keys(s::TVec) = TVecIterator(keys, s.segments)
-Base.pairs(s::TVec) = TVecIterator(pairs, s.segments)
 
 function Base.mapreduce(f, op, s::TVecIterator; kwargs...)
     return Folds.mapreduce(op, s.segments; kwargs...) do v
@@ -178,11 +184,15 @@ function LinearAlgebra.axpy!(α, v::TVec, w::TVec)
 end
 function LinearAlgebra.dot(v::TVec, w::TVec)
     T = promote_type(valtype(v), valtype(w))
-    if num_segments(v) == num_segments(w)
-        return sum(pairs(v); init=zero(T)) do (key, val)
-            w[key] * val
-        end
-    else
-        return invoke(dot, Tuple{AbstractDVec,AbstractDVec}, v, w)
-    end
+    return sum(pairs(v); init=zero(T)) do (key, val)
+        conj(val) * w[key]
+    end::T
+end
+function Base.real(v::TVec)
+    dst = similar(v, real(valtype(v)))
+    map!(real, dst, values(v))
+end
+function Base.imag(v::TVec)
+    dst = similar(v, real(valtype(v)))
+    map!(imag, dst, values(v))
 end

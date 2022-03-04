@@ -4,6 +4,8 @@ struct EquippedOperator{O,W}
     operator::O
     working_memory::W
 end
+Base.eltype(::EquippedOperator{O}) where {O} = eltype(O)
+Base.eltype(::Type{<:EquippedOperator{O}}) where {O} = eltype(O)
 
 function equip(operator; num_segments=4, style=default_style(eltype(operator)))
     T = eltype(operator)
@@ -27,7 +29,8 @@ end
 
 function KrylovKit.eigsolve(
     ham::AbstractHamiltonian, dv::TVec, howmany::Int, which::Symbol=:SR;
-    issymmetric = LOStructure(ham) == IsHermitian(),
+    issymmetric = eltype(ham) <: Real && LOStructure(ham) === IsHermitian(),
+    ishermitian = LOStructure(ham) === IsHermitian(),
     kwargs...
 )
     eo = equip(ham)

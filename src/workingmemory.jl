@@ -1,6 +1,22 @@
 using Rimu: SplittablesThreading
 using Rimu.StochasticStyles: ThresholdCompression, NoCompression
 
+"""
+    WorkingMemory
+
+This structure is used when spawning or performing matrix-vector multiplications to
+ensure different threads access different regions in memory.
+
+## Workflow:
+
+```julia
+empty!(w)
+spawns!(operation, w, src)
+merge_blocks!(w)
+synchronize!(w)
+collect!(operation, dst, w)
+```
+"""
 struct WorkingMemory{W,S,NR,ID}
     blocks::Matrix{W} # num_segments * num_ranks × num_segments
     style::S
@@ -27,6 +43,12 @@ function Rimu.deposit!(w::WorkingMemory, index, key, value, parent=nothing)
     seg = mod1(h, num_global_blocks(w))
     deposit!(w.blocks[seg, index], key, value, h, parent)
 end
+function Base.getindex(w::WorkingMemory, index, key)
+    h = hash(key)
+    seg = mod1(h, num_global_blocks(w))
+    return w.blocks[seg, index][key]
+end
+
 function get_diagonal(w::WorkingMemory, index)
     if num_ranks(w) == 1
         return w.blocks[index, index]
@@ -62,6 +84,7 @@ struct WorkingMemoryStrip{W}
 end
 get_strip(w::WorkingMemory, i) = WorkingMemoryStrip(w, i)
 Rimu.deposit!(s::WorkingMemoryStrip, args...) = deposit!(s.working_memory, s.index, args...)
+Rimu.getindex(s::WorkingMemoryStrip, key) = s.working_memory[s.index, key]
 Base.empty!(s::WorkingMemoryStrip) = foreach(empty!, view(s.working_memory.blocks, :, s.index))
 Base.keytype(s::WorkingMemoryStrip) = keytype(eltype(s.working_memory.blocks))
 Base.valtype(s::WorkingMemoryStrip) = valtype(eltype(s.working_memory.blocks))
@@ -109,7 +132,7 @@ function Rimu.fciqmc_step!(
 )
     stat_names, stats = step_stats(src, Val(1))
     style = StochasticStyle(src)
-    result = Folds.sum(1:num_segments(src)) do i
+    result = Folds.sum(1:num_segments(src); init=stats) do i
         strip = get_strip(w, i)
         empty!(strip)
         sum(pairs(src.segments[i]); init=stats) do (add, val)
@@ -159,7 +182,6 @@ function move_and_compress!(::NoCompression, dst::TVec, src::WorkingMemory)
     return dst
 end
 
-
 function dosomething(operation, w, dst, src)
     empty!(w)
     spawns!(operation, w, src)
@@ -167,10 +189,3 @@ function dosomething(operation, w, dst, src)
     synchronize!(w)
     collect!(operation, dst, w)
 end
-
-function times_it(op, w, src)
-    dst = similar(src)
-    dosomething(OperatorMultiply(op), w, dst, src)
-end
-
-export times_it
