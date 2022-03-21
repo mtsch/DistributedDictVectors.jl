@@ -205,3 +205,23 @@ function Base.imag(v::TVec)
     dst = similar(v, real(valtype(v)))
     map!(imag, dst, values(v))
 end
+
+function Base.:+(v::AbstractDVec, w::AbstractDVec)
+    result = similar(v, promote_type(valtype(v), valtype(w)))
+    copy!(result, v)
+    add!(result, w)
+    return result
+end
+function Base.:-(v::AbstractDVec, w::AbstractDVec)
+    result = similar(v, promote_type(valtype(v), valtype(w)))
+    copy!(result, v)
+    return axpy!(-one(valtype(result)), w, result)
+end
+function LinearAlgebra.normalize!(v::AbstractDVec, p=2)
+    n = norm(v, p)
+    rmul!(v, inv(n))
+end
+function LinearAlgebra.normalize(v::AbstractDVec, p=2)
+    res = copy(v)
+    normalize!(res, p)
+end

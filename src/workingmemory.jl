@@ -102,28 +102,6 @@ Base.valtype(s::WorkingMemoryStrip) = valtype(eltype(s.working_memory.blocks))
 # sync step: diagonals are exchanged among MPI ranks
 # move step: result is moved to destination
 
-struct OperatorMultiply{O}
-    operator::O
-end
-
-function spawns!(om::OperatorMultiply, w::WorkingMemory, src::TVec)
-    op = om.operator
-    Folds.foreach(1:num_segments(src)) do i
-        for (src_add, src_val) in pairs(src.segments[i])
-            deposit!(w, i, src_add, diagonal_element(op, src_add) * src_val)
-            for (add, val) in offdiagonals(op, src_add)
-                deposit!(w, i, add, val * src_val)
-            end
-        end
-    end
-end
-function collect!(::OperatorMultiply, dst::TVec, w::WorkingMemory)
-    Folds.foreach(1:num_segments(dst)) do i
-        copy!(dst.segments[i], get_diagonal(w, i))
-    end
-    return dst
-end
-
 function Rimu.working_memory(::SplittablesThreading, t::TVec)
     return WorkingMemory(t)
 end
@@ -174,18 +152,24 @@ function move_and_compress!(::NoCompression, dst::TVec, src::WorkingMemory)
     Folds.foreach(1:num_segments(dst)) do i
         dst_seg = dst.segments[i]
         src_seg = get_diagonal(src, i)
-        empty!(dst_seg)
-        for (add, val) in pairs(src_seg)
-            dst_seg[add] = val
-        end
+        copy!(dst_seg, src_seg)
     end
     return dst
 end
 
-function dosomething(operation, w, dst, src)
-    empty!(w)
-    spawns!(operation, w, src)
+function LinearAlgebra.mul!(dst, op, src, w, style=StochasticStyle(src))
+    T = valtype(dst)
+    # Perform spawns. Note that setting shift to 1 and dτ to -1 turns this into regular
+    # matrix-vector multiply.
+    Folds.foreach(1:num_segments(src)) do i
+        strip = get_strip(w, i)
+        empty!(strip)
+        foreach(pairs(src.segments[i])) do (add, val)
+            fciqmc_col!(style, strip, op, add, val, one(T), -one(T))
+        end
+    end
     merge_blocks!(w)
     synchronize!(w)
-    collect!(operation, dst, w)
+    move_and_compress!(CompressionStrategy(style), dst, w)
+    return dst
 end
