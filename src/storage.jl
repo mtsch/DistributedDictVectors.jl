@@ -390,3 +390,7 @@ function LinearAlgebra.dot(v::Storage, w::Storage)
     end
     return result
 end
+
+function MPI.Buffer(v::Storage)
+    return MPI.Buffer(v.pairs)
+end

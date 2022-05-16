@@ -6,19 +6,34 @@ struct TVec{
     style::S
 end
 
-function TVec{K,V}(; style=default_style(V), num_segments=4) where {K,V}
+function TVec{K,V}(
+    ; style=default_style(V), num_segments=4,
+    _num_ranks=nothing,
+    _rank_id=nothing,
+) where {K,V}
     comm = MPI.COMM_WORLD
-    num_ranks = MPI.Comm_size(comm)
-    rank_id = MPI.Comm_rank(comm)
+
+    # Setting the following only supported for debugging.
+    num_ranks = isnothing(_num_ranks) ? MPI.Comm_size(comm) : _num_ranks
+    rank_id = isnothing(_rank_id) ? MPI.Comm_rank(comm) : _rank_id
     segments = [Storage{K,V}() for _ in 1:num_segments * Threads.nthreads()]
 
     TVec{K,V,eltype(segments),typeof(segments),typeof(style),num_ranks,rank_id}(
         segments, style
     )
 end
-function TVec(ps::Vararg{Pair{K,V}}; style=default_style(V), num_segments=4) where {K,V}
-    t = TVec{K,V}(; style, num_segments)
+function TVec(ps::Vararg{Pair{K,V}}; kwargs...) where {K,V}
+    t = TVec{K,V}(; kwargs...)
     for (k, v) in ps
+        t[k] = v
+    end
+    return t
+end
+function TVec(pairs; kwargs...)
+    K = typeof(first(pairs)[1])
+    V = typeof(first(pairs)[2])
+    t = TVec{K,V}(; kwargs...)
+    for (k, v) in pairs
         t[k] = v
     end
     return t
@@ -27,10 +42,17 @@ end
 # Properties
 rank_id(t::TVec{<:Any,<:Any,<:Any,<:Any,<:Any,<:Any,ID}) where {ID} = ID
 num_ranks(t::TVec{<:Any,<:Any,<:Any,<:Any,<:Any,NR}) where {NR} = NR
-is_distributed(t) = num_ranks(t) > 1
-num_segments(t) = length(t.segments)
-Base.length(s::TVec) = sum(length, s.segments)
+is_distributed(t::TVec) = num_ranks(t) > 1
+num_segments(t::TVec) = length(t.segments)
 Rimu.StochasticStyle(s::TVec) = s.style
+
+function Base.length(s::TVec)
+    if is_distributed(s)
+        MPI.Allreduce(sum(length, s.segments), +, MPI.COMM_WORLD)
+    else
+        sum(length, s.segments)
+    end
+end
 
 function Base.copyto!(dst::TVec, src::TVec)
     if num_segments(dst) == num_segments(src)
@@ -39,6 +61,7 @@ function Base.copyto!(dst::TVec, src::TVec)
         end
         return dst
     else
+        # Mismatched number of segments - copy by moving each element over.
         return invoke(copyto!, Tuple{AbstractDVec, TVec}, dst, src)
     end
 end
@@ -49,30 +72,43 @@ function Base.copy(dst::TVec, src::TVec)
     return copy!(empty(dst), src)
 end
 
-# Get and set
-function target_segment(t, h)
-    is_distributed(t) && throw(ArgumentError(
-        "`getindex`, `setindex!` and `deposit!` are not supported accross MPI."
-    ))
-    nsegs = num_segments(t)
-    return mod1(h, nsegs) - rank_id(t) * nsegs
+"""
+     target_segment(t::TVec, hash::UInt64)
+
+Determine the target segment from key hash. For MPI distributed vectors, this may return
+numbers that are out of range.
+"""
+function target_segment(t, hash::UInt64)
+    total_segments = num_segments(t) * num_ranks(t)
+    return mod1(hash, total_segments) % Int - rank_id(t) * num_segments(t)
 end
 
 function Base.getindex(t::TVec{K}, key::K) where {K}
     h = hash(key)
-    seg = t.segments[target_segment(t, h)]
-    return getindex(seg, key, h)
+    target = target_segment(t, h)
+    if 1 ≤ target ≤ num_segments(t)
+        getindex(t.segments[target_segment(t, h)], key, h)
+    else
+        error("attempted to `getindex` from different MPI rank")
+    end
 end
 
 function Base.setindex!(t::TVec{K,V}, val, key::K) where {K,V}
     h = hash(key)
-    seg = t.segments[target_segment(t, h)]
-    return setindex!(seg, V(val), key, h)
+    target = target_segment(t, h)
+    if 1 ≤ target ≤ num_segments(t)
+        return setindex!(t.segments[target_segment(t, h)], V(val), key, h)
+    else
+        return V(val)
+    end
 end
 function Rimu.deposit!(t::TVec{K,V}, key::K, val, parent) where {K,V}
     h = hash(key)
-    seg = t.segments[target_segment(t, h)]
-    return deposit!(seg, key, V(val), h, parent)
+    target = target_segment(t, h)
+    if 1 ≤ seg ≤ num_segments(t)
+        deposit!(t.segments[target_segment(t, h)], key, V(val), h, parent)
+    end
+    return nothing
 end
 
 ###
@@ -101,12 +137,12 @@ end
 ###
 ### Iterators and parallel reduction
 ###
-struct TVecIterator{F,V,T}
+struct TVecIterator{F,V,T,D}
     fun::F
     segments::V
 
     function TVecIterator(fun::F, ::Type{T}, tv::TVec) where {F,T}
-        return new{F,typeof(tv.segments),T}(fun, tv.segments)
+        return new{F,typeof(tv.segments),T,is_distributed(tv)}(fun, tv.segments)
     end
 end
 Base.values(s::TVec) = TVecIterator(values, valtype(s), s)
@@ -115,8 +151,12 @@ Base.pairs(s::TVec) = TVecIterator(pairs, eltype(s), s)
 
 Base.eltype(s::Type{<:TVecIterator{<:Any,<:Any,T}}) where {T} = T
 Base.length(s::TVecIterator) = sum(length, s.segments)
+is_distributed(s::TVecIterator{<:Any,<:Any,<:Any,D}) where {D} = D
+
 function Base.iterate(s::TVecIterator, i::Int=1)
-    @warn "Iteration is unsupported. Please use `map`, `mapreduce`, etc..." maxlog=1
+    if is_distributed(s)
+        @warn "Vector is distributed, iterating over local entries only." maxlog=1
+    end
     if i > length(s.segments)
         return nothing
     end
@@ -137,8 +177,14 @@ function Base.iterate(s::TVecIterator, (i, st))
 end
 
 function Base.mapreduce(f, op, s::TVecIterator; kwargs...)
-    return Folds.mapreduce(op, s.segments; kwargs...) do v
+    result = Folds.mapreduce(op, s.segments; kwargs...) do v
         mapreduce(f, op, s.fun(v); kwargs...)
+    end
+    # The compiler will know whether it's distributed or not and elide this statement.
+    if is_distributed(s)
+        return MPI.Allreduce(result, op, MPI.COMM_WORLD)
+    else
+        return result
     end
 end
 function Base.map!(f, s::TVecIterator{typeof(values)})
@@ -192,11 +238,27 @@ function LinearAlgebra.axpy!(α, v::TVec, w::TVec)
     return w
 end
 function LinearAlgebra.dot(v::TVec, w::TVec)
+    # TODO Check for match or fall back to default implementation
     T = promote_type(valtype(v), valtype(w))
-    return Folds.sum(zip(v.segments, w.segments)) do (v_s, w_s)
+    result = Folds.sum(zip(v.segments, w.segments)) do (v_s, w_s)
         dot(v_s, w_s)
     end::T
+    if is_distributed(v)
+        return MPI.Allreduce(result, +, MPI.COMM_WORLD)
+    else
+        return result
+    end
 end
+function LinearAlgebra.dot(v::AbstractDVec, w::TVec)
+    result = invoke(dot, Tuple{AbstractDVec,AbstractDVec}, v, w)
+    if is_distributed(w)
+        return MPI.Allreduce(result, +, MPI.COMM_WORLD)
+    else
+        return result
+    end
+end
+LinearAlgebra.dot(w::TVec, v::AbstractDVec) = dot(v, w)
+
 function Base.real(v::TVec)
     dst = similar(v, real(valtype(v)))
     map!(real, dst, values(v))
@@ -220,8 +282,9 @@ end
 function LinearAlgebra.normalize!(v::AbstractDVec, p=2)
     n = norm(v, p)
     rmul!(v, inv(n))
+    return v
 end
 function LinearAlgebra.normalize(v::AbstractDVec, p=2)
     res = copy(v)
-    normalize!(res, p)
+    return normalize!(res, p)
 end
