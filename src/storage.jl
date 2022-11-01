@@ -31,6 +31,53 @@ struct Token
     pointer::Int
 end
 
+"""
+    Storage{K,V,T<:Signed}
+
+This is an internal default dict implementation used in `TVec`s. The goals for this
+structure is to support fast in-place updating and iteration. It returns `zero(V)` for keys
+not in the dictionary and automatically deletes zero entries.
+
+A `Storage` consists of three arrays, `pointers`, `pairs`, and `next`. The `pairs` and
+`next` are contiguous arrays, while `pointers` is structured more like a traditional hash
+table. `pointers` and `next` form a linked list used to find the pairs in the dictionary.
+
+Supported operations include getting/setting indices, possibly with a precomputed hash
+values, updating in-place with [`deposit!`](@ref), iteration over keys/values/pairs, `map!`,
+`dot`, and [`add!`](@ref).
+
+# Example
+
+```jldoctest
+julia> st = DistributedDictVectors.Storage{Int,Float64}()
+0-element Storage{Int64,Float64,Int32}
+
+julia> st[1] = 2.5
+2.5
+
+julia> st[2] = 3.5
+3.5
+
+julia> deposit!(st, 5, 4.5) # key 5 does not exist and is created
+4.5
+
+julia> deposit!(st, 5, 4.5) # key 5 is updated
+9.0
+
+julia> deposit!(st, 1, -2.5) # key 1 now contains a zero and is deleted
+0.0
+
+julia> map!(x -> 2x, values(st))
+
+julia> st
+2-element Storage{Int64,Float64,Int32}
+ 5 => 18.0
+ 2 => 7.0
+
+julia> st[15] # key 15 does not exist - `zero(Float64)` is returned.
+0.0
+```
+"""
 struct Storage{K,V,T<:Signed}
     pointers::Vector{T}
     pairs::Vector{Pair{K,V}}
@@ -43,10 +90,10 @@ function Storage{K,V,T}(; capacity=100) where {K,V,T}
     next = T[]
     return Storage(pointers, pairs, next, Ref(0))
 end
-Storage{K,V}(; kwargs...) where {K,V} = Storage{K,V,Int32}(; kwargs...)
+Storage{K,V}(; kwargs...) where {K,V} = Storage{K,V,Int64}(; kwargs...)
 
 ###
-### Basic properties
+### Basic property boilerplate
 ###
 Base.length(dv::Storage) = length(dv.next)
 Base.isempty(dv::Storage) = isempty(dv.next)
@@ -116,9 +163,9 @@ Find a [`Token`](@ref) that corresponds to the `key`.
     end
 end
 """
-    get_token_by_index(dv::Storage, index)
+    get_token_by_index(dv::Storage, index::Integer)
 
-Find a [`Token`](@ref) that corresponds to the `index` in the `pairs` array.
+Find a [`Token`](@ref) that corresponds to the position in the `pairs` array.
 """
 @inline function get_token_by_index(dv::Storage, index::Integer)
     T = indextype(dv)
@@ -138,8 +185,8 @@ end
 """
     update_parent!(dv::Storage, t::Token, new::Integer)
 
-Update the parent of token `t` to point to new. If `t` has no parent, the `pointers` array
-is updated instead.
+Update the parent of token `t` to point to `new`. If `t` has no parent, an entry in the
+`pointers` array is created instead.
 """
 @inline Base.@propagate_inbounds function update_parent!(dv::Storage, t::Token, new::Integer)
     T = indextype(dv)
@@ -209,14 +256,14 @@ function maybe_swap_parent!(dv, index, parent, pair)
     end
 end
 
-function Base.setindex!(dv::Storage{K,V}, v, key, h=hash(key)) where {K,V}
+@inline function Base.setindex!(dv::Storage{K,V}, v, key, h=hash(key)) where {K,V}
     value = V(v)
     token = get_token_by_key(dv, key, h)
     update!(dv, token, key => value)
     return value
 end
 
-function Rimu.deposit!(dv::Storage{K,V}, key, v, h=hash(key), parent=nothing) where {K,V}
+@inline function Rimu.deposit!(dv::Storage{K,V}, key, v, h=hash(key), parent=nothing) where {K,V}
     value = V(v)
     token = get_token_by_key(dv, key, h)
     if !iszero(token.index)
@@ -232,8 +279,8 @@ end
 ###
 function Base.empty!(dv::Storage)
     # Note: empty! changes the number of pointers in dv to have enough space to comfortably
-    # fit its previous length. This can be done because we empty the vector after every
-    # FCIQMC step
+    # fit its previous length. This can prevent some rehashing because we empty the vector
+    # after every FCIQMC step
     n_target = target_capacity(dv.maxlength[])
     empty!(dv.pairs)
     empty!(dv.next)
@@ -255,18 +302,20 @@ function Base.empty(dv::Storage{<:Any,<:Any,T}, ::Type{K}, ::Type{V}) where {K,V
 end
 
 function rehash!(dv::Storage)
+    # Set all next pointers as if they were root entries.
     dv.next .= .-fastrange.(hash.(first.(dv.pairs)), length(dv.pointers))
+    # Invalidate all pointers.
     dv.pointers .= -1
     @inbounds for i in 1:length(dv)
         pointer = -dv.next[i]
         parent = 0
         index = dv.pointers[pointer]
 
+        # If pointer is taken, find the root entry.
         while index > 0
             parent = index
             index = dv.next[index]
         end
-
         update_parent!(dv, Token(parent, i, pointer), i)
     end
     return dv
@@ -296,6 +345,7 @@ function Base.copy!(dst::Storage{K,V}, src::Storage{K,V}) where {K,V}
     return dst
 end
 
+# Note: this is wrapped so that the array can't be mutated.
 """
     pairs(dv::Storage)
 
@@ -346,7 +396,8 @@ end
     map!(f, dst::Storage, values(src::Storage))
 
 Apply function to all values in `dv`.
-When mapping over `pairs`, the function should return the value type.
+When mapping over `pairs`, the function should return the value type - only the values can
+be changed.
 """
 function Base.map!(f, vs::StorageValues)
     dv = vs.dvec

@@ -68,12 +68,12 @@ function WorkingMemory(t::TVec; style=t.style)
 end
 function Rimu.deposit!(w::WorkingMemory, index, key, value, parent=nothing)
     h = hash(key)
-    seg = mod1(h, height(w))
+    seg = _mod1(h, height(w)) % Int
     deposit!(w.entries[seg, index], key, value, h, parent)
 end
 #function Base.getindex(w::WorkingMemory, index, key)
 #    h = hash(key)
-#    seg = mod1(h, height(w))
+#    seg = _mod1(h, height(w))
 #    return w.entries[seg, index][key]
 #end
 
@@ -126,7 +126,7 @@ function merge_rows!(w::WorkingMemory)
     nlocal = num_threads(w)
 
     Folds.foreach(1:height(w)) do i
-        diag_index = mod1(i, nlocal)
+        diag_index = _mod1(i, nlocal)
         for j in 1:nlocal
             j == diag_index && continue
             add!(w.entries[i, diag_index], w.entries[i, j])
@@ -142,7 +142,7 @@ function exchange!(w::WorkingMemory, rank_id, thread_id)
 
     row = rank_id * num_threads(w) + thread_id
     send_arr = w[row, thread_id].pairs
-    recv_arr = w[row, mod1(thread_id + 1, num_threads(w))].pairs
+    recv_arr = w[row, _mod1(thread_id + 1, num_threads(w))].pairs
 
     MPI.Isend(MPI.Buffer(send_arr), rank_id, thread_id, MPI.COMM_WORLD)
 
@@ -170,7 +170,7 @@ function mpi_send!(w::WorkingMemory, rank_id, thread_id)
 end
 function mpi_recv!(w::WorkingMemory, rank_id, thread_id)
     row = rank_id * num_threads(w) + thread_id
-    recv_arr = w[row, mod1(thread_id + 1, num_threads(w))].pairs
+    recv_arr = w[row, _mod1(thread_id + 1, num_threads(w))].pairs
 
     recv_len = MPI.Get_count(
         MPI.Probe(rank_id, thread_id, MPI.COMM_WORLD), eltype(recv_arr)
@@ -181,7 +181,7 @@ end
 function mpi_collect!(w::WorkingMemory, rank_id, thread_id)
     # Move to diagonal
     row = rank_id * num_threads(w) + thread_id
-    recv_arr = w[row, mod1(thread_id + 1, num_threads(w))].pairs
+    recv_arr = w[row, _mod1(thread_id + 1, num_threads(w))].pairs
 
     diag = get_diagonal(w, thread_id)
     for (k, v) in recv_arr
@@ -245,7 +245,7 @@ function LinearAlgebra.mul!(dst, op, src, w, style=StochasticStyle(src))
     Folds.foreach(1:num_segments(src)) do i
         strip = w[:, i]
         empty!(strip)
-        foreach(pairs(src.segments[i])) do (add, val)
+        for (add, val) in pairs(src.segments[i])
             fciqmc_col!(style, strip, op, add, val, one(T), -one(T))
         end
     end
@@ -270,6 +270,23 @@ function Rimu.working_memory(::SplittablesThreading, t::TVec)
 end
 function Rimu.fciqmc_step!(
     ::SplittablesThreading, w::WorkingMemory, ham, src::TVec, shift, dτ
+)
+    stat_names, stats = step_stats(src, Val(1))
+    style = StochasticStyle(src)
+    result = Folds.sum(1:num_segments(src); init=stats) do i
+        strip = w[:, i]
+        empty!(strip)
+        sum(pairs(src.segments[i]); init=stats) do (add, val)
+            fciqmc_col!(style, strip, ham, add, val, shift, dτ)
+        end
+    end
+    return stat_names, result
+end
+function Rimu.working_memory(::Rimu.NoThreading, t::TVec)
+    return WorkingMemory(t)
+end
+function Rimu.fciqmc_step!(
+    ::Rimu.NoThreading, w::WorkingMemory, ham, src::TVec, shift, dτ
 )
     stat_names, stats = step_stats(src, Val(1))
     style = StochasticStyle(src)

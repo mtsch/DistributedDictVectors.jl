@@ -1,3 +1,5 @@
+_mod1(x, y) = mod1(x, y)#mod(x, y) + 0x1
+
 struct TVec{
     K,V,D<:Storage{K,V},A<:AbstractVector{D},S<:StochasticStyle,
     NR,ID
@@ -16,7 +18,8 @@ function TVec{K,V}(
     # Setting the following only supported for debugging.
     num_ranks = isnothing(_num_ranks) ? MPI.Comm_size(comm) : _num_ranks
     rank_id = isnothing(_rank_id) ? MPI.Comm_rank(comm) : _rank_id
-    segments = [Storage{K,V}() for _ in 1:num_segments * Threads.nthreads()]
+    tot_segments = num_segments * Threads.nthreads() #Threads.nthreads() > 1 ? num_segments * Threads.nthreads() : 1
+    segments = [Storage{K,V}() for _ in 1:tot_segments]
 
     TVec{K,V,eltype(segments),typeof(segments),typeof(style),num_ranks,rank_id}(
         segments, style
@@ -80,7 +83,7 @@ numbers that are out of range.
 """
 function target_segment(t, hash::UInt64)
     total_segments = num_segments(t) * num_ranks(t)
-    return mod1(hash, total_segments) % Int - rank_id(t) * num_segments(t)
+    return _mod1(hash, total_segments) % Int - rank_id(t) * num_segments(t)
 end
 
 function Base.getindex(t::TVec{K}, key::K) where {K}
@@ -105,7 +108,7 @@ end
 function Rimu.deposit!(t::TVec{K,V}, key::K, val, parent) where {K,V}
     h = hash(key)
     target = target_segment(t, h)
-    if 1 ≤ seg ≤ num_segments(t)
+    if 1 ≤ target ≤ num_segments(t)
         deposit!(t.segments[target_segment(t, h)], key, V(val), h, parent)
     end
     return nothing
