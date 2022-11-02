@@ -2,7 +2,7 @@ using Rimu: SplittablesThreading
 using Rimu.StochasticStyles: ThresholdCompression, NoCompression
 
 """
-    WorkingMemory
+    WorkingMemoryOld
 
 This structure is used when spawning or performing matrix-vector multiplications to
 ensure different threads access different regions in memory.
@@ -24,105 +24,105 @@ synchronize!(w)
 collect!(operation, dst, w)
 ```
 """
-struct WorkingMemory{W,S,NR,ID}
+struct WorkingMemoryOld{W,S,NR,ID}
     entries::Matrix{W} # num_segments * num_ranks × num_segments
     style::S
 end
 
-rank_id(w::WorkingMemory{<:Any,<:Any,<:Any,ID}) where {ID} = ID
+rank_id(w::WorkingMemoryOld{<:Any,<:Any,<:Any,ID}) where {ID} = ID
 
 """
-    height(::WorkingMemory)
+    height(::WorkingMemoryOld)
 
 The number of blocks of a working memory is the same as the number of MPI ranks over which
 the vector is distributed.
 """
-num_ranks(w::WorkingMemory{<:Any,<:Any,NR}) where {NR} = NR
+num_ranks(w::WorkingMemoryOld{<:Any,<:Any,NR}) where {NR} = NR
 
 """
-    height(::WorkingMemory)
+    height(::WorkingMemoryOld)
 
 The height of a working memory is the number of entries in each of its columns. This is
 equivalent to the number of segments (accross all ranks) in the vector.
 """
-height(w::WorkingMemory) = size(w.entries, 1)
+height(w::WorkingMemoryOld) = size(w.entries, 1)
 
 """
-    num_threads(::WorkingMemory)
+    num_threads(::WorkingMemoryOld)
 
 The num_threads of a working memory is the number of entries in each of its rows. This is
 equivalent to the number of segments in the local part of the vector.
 """
-num_threads(w::WorkingMemory) = size(w.entries, 2)
+num_threads(w::WorkingMemoryOld) = size(w.entries, 2)
 
-Base.length(w::WorkingMemory) = sum(length, w.entries)
+Base.length(w::WorkingMemoryOld) = sum(length, w.entries)
 
-function WorkingMemory(t::TVec; style=t.style)
+function WorkingMemoryOld(t::TVecOld; style=t.style)
     nsegs = num_segments(t)
     nranks = num_ranks(t)
     blocks = [empty(t.segments[1]) for i in 1:nsegs * nranks, j in 1:nsegs]
 
-    return WorkingMemory{eltype(blocks),typeof(style),num_ranks(t),rank_id(t)}(
+    return WorkingMemoryOld{eltype(blocks),typeof(style),num_ranks(t),rank_id(t)}(
         blocks, style
     )
 end
-function Rimu.deposit!(w::WorkingMemory, index, key, value, parent=nothing)
+function Rimu.deposit!(w::WorkingMemoryOld, index, key, value, parent=nothing)
     h = hash(key)
     seg = _mod1(h, height(w)) % Int
     deposit!(w.entries[seg, index], key, value, h, parent)
 end
-#function Base.getindex(w::WorkingMemory, index, key)
+#function Base.getindex(w::WorkingMemoryOld, index, key)
 #    h = hash(key)
 #    seg = _mod1(h, height(w))
 #    return w.entries[seg, index][key]
 #end
 
 """
-    get_diagonal(w::WorkingMemory, i)
+    get_diagonal(w::WorkingMemoryOld, i)
 
 Get the `i`-th diagonal entry in working memory. This is the entry that is transferred back
 to the vector in the [`merge_and_compress!`](@ref) step.
 
 NOTE: diagonal is diagonal in the block.
 """
-function get_diagonal(w::WorkingMemory, index)
+function get_diagonal(w::WorkingMemoryOld, index)
     return w.entries[index + rank_id(w) * num_threads(w), index]
 end
-function Base.empty!(w::WorkingMemory)
+function Base.empty!(w::WorkingMemoryOld)
     foreach(empty!, w.entries)
     return w
 end
 
-Base.getindex(w::WorkingMemory, r::Int, c::Int) = w.entries[r, c]
-Base.getindex(w::WorkingMemory, ::Colon, c) = WorkingMemoryColumn(w, c)
+Base.getindex(w::WorkingMemoryOld, r::Int, c::Int) = w.entries[r, c]
+Base.getindex(w::WorkingMemoryOld, ::Colon, c) = WorkingMemoryOldColumn(w, c)
 
 """
-    WorkingMemoryColumn
+    WorkingMemoryOldColumn
 
-A column in a [`WorkingMemory`](@ref). Used to allow spawning from a vector in a thread-safe
+A column in a [`WorkingMemoryOld`](@ref). Used to allow spawning from a vector in a thread-safe
 manner. Supports enough of the `AbstractDVec` interface to be usable as a target for
 [`fciqmc_col!`](@ref).
 """
-struct WorkingMemoryColumn{W}
+struct WorkingMemoryOldColumn{W}
     working_memory::W
     index::Int
 end
-function Rimu.deposit!(s::WorkingMemoryColumn, args...)
+function Rimu.deposit!(s::WorkingMemoryOldColumn, args...)
     return deposit!(s.working_memory, s.index, args...)
 end
-function Rimu.getindex(s::WorkingMemoryColumn, key)
+function Rimu.getindex(s::WorkingMemoryOldColumn, key)
     return s.working_memory[s.index, key]
 end
-function Base.empty!(s::WorkingMemoryColumn)
+function Base.empty!(s::WorkingMemoryOldColumn)
     return foreach(empty!, view(s.working_memory.entries, :, s.index))
 end
-Base.keytype(s::WorkingMemoryColumn) = keytype(eltype(s.working_memory.entries))
-Base.valtype(s::WorkingMemoryColumn) = valtype(eltype(s.working_memory.entries))
+Base.keytype(s::WorkingMemoryOldColumn) = keytype(eltype(s.working_memory.entries))
+Base.valtype(s::WorkingMemoryOldColumn) = valtype(eltype(s.working_memory.entries))
 
 ###
 ### Operations
 ###
-function merge_rows!(w::WorkingMemory)
+function merge_rows!(w::WorkingMemoryOld)
     nlocal = num_threads(w)
 
     Folds.foreach(1:height(w)) do i
@@ -134,7 +134,7 @@ function merge_rows!(w::WorkingMemory)
     end
 end
 
-function exchange!(w::WorkingMemory, rank_id, thread_id)
+function exchange!(w::WorkingMemoryOld, rank_id, thread_id)
     @assert num_threads(w) ≥ 2 # or we can't find the recieving buffer
 
     # Maybe this would be more efficient if all ranks (asynchronously) sent first, then all
@@ -158,7 +158,7 @@ function exchange!(w::WorkingMemory, rank_id, thread_id)
         deposit!(diag, k, v)
     end
 end
-function mpi_send!(w::WorkingMemory, rank_id, thread_id)
+function mpi_send!(w::WorkingMemoryOld, rank_id, thread_id)
     @assert num_threads(w) ≥ 2 # or we can't find the recieving buffer
 
     # Maybe this would be more efficient if all ranks (asynchronously) sent first, then all
@@ -168,7 +168,7 @@ function mpi_send!(w::WorkingMemory, rank_id, thread_id)
 
     MPI.Isend(MPI.Buffer(send_arr), rank_id, thread_id, MPI.COMM_WORLD)
 end
-function mpi_recv!(w::WorkingMemory, rank_id, thread_id)
+function mpi_recv!(w::WorkingMemoryOld, rank_id, thread_id)
     row = rank_id * num_threads(w) + thread_id
     recv_arr = w[row, _mod1(thread_id + 1, num_threads(w))].pairs
 
@@ -178,7 +178,7 @@ function mpi_recv!(w::WorkingMemory, rank_id, thread_id)
     resize!(recv_arr, recv_len)
     MPI.Recv!(recv_arr, rank_id, thread_id, MPI.COMM_WORLD)
 end
-function mpi_collect!(w::WorkingMemory, rank_id, thread_id)
+function mpi_collect!(w::WorkingMemoryOld, rank_id, thread_id)
     # Move to diagonal
     row = rank_id * num_threads(w) + thread_id
     recv_arr = w[row, _mod1(thread_id + 1, num_threads(w))].pairs
@@ -189,7 +189,7 @@ function mpi_collect!(w::WorkingMemory, rank_id, thread_id)
     end
 end
 
-function synchronize!(w::WorkingMemory)
+function synchronize!(w::WorkingMemoryOld)
     if num_ranks(w) > 1
         foreach(1:num_threads(w)) do thread_id
             for rank in 0:(num_ranks(w) - 1)
@@ -213,14 +213,14 @@ function synchronize!(w::WorkingMemory)
     return w
 end
 
-function move_and_compress!(t::ThresholdCompression, dst::TVec, src::WorkingMemory)
+function move_and_compress!(t::ThresholdCompression, dst::TVecOld, src::WorkingMemoryOld)
     Folds.foreach(1:num_segments(dst)) do i
         dst_seg = dst.segments[i]
         src_seg = get_diagonal(src, i)
         empty!(dst_seg)
         for (add, val) in pairs(src_seg)
             prob = abs(val) / t.threshold
-            if prob < 1 && prob > cRand()
+            if prob < 1 && prob > rand()
                 dst_seg[add] = t.threshold * sign(val)
             elseif prob ≥ 1
                 dst_seg[add] = val
@@ -229,7 +229,7 @@ function move_and_compress!(t::ThresholdCompression, dst::TVec, src::WorkingMemo
     end
     return dst
 end
-function move_and_compress!(::NoCompression, dst::TVec, src::WorkingMemory)
+function move_and_compress!(::NoCompression, dst::TVecOld, src::WorkingMemoryOld)
     Folds.foreach(1:num_segments(dst)) do i
         dst_seg = dst.segments[i]
         src_seg = get_diagonal(src, i)
@@ -255,8 +255,8 @@ function LinearAlgebra.mul!(dst, op, src, w, style=StochasticStyle(src))
     return dst
 end
 
-function Base.:*(op::AbstractHamiltonian, tv::TVec)
-    wm = WorkingMemory(tv)
+function Base.:*(op::AbstractHamiltonian, tv::TVecOld)
+    wm = WorkingMemoryOld(tv)
     dst = similar(tv, promote_type(eltype(op), valtype(tv)))
     mul!(dst, op, tv, wm)
 end
@@ -265,11 +265,11 @@ end
 ###
 ### Rimu compat.
 ###
-function Rimu.working_memory(::SplittablesThreading, t::TVec)
-    return WorkingMemory(t)
+function Rimu.working_memory(::SplittablesThreading, t::TVecOld)
+    return WorkingMemoryOld(t)
 end
 function Rimu.fciqmc_step!(
-    ::SplittablesThreading, w::WorkingMemory, ham, src::TVec, shift, dτ
+    ::SplittablesThreading, w::WorkingMemoryOld, ham, src::TVecOld, shift, dτ
 )
     stat_names, stats = step_stats(src, Val(1))
     style = StochasticStyle(src)
@@ -282,11 +282,11 @@ function Rimu.fciqmc_step!(
     end
     return stat_names, result
 end
-function Rimu.working_memory(::Rimu.NoThreading, t::TVec)
-    return WorkingMemory(t)
+function Rimu.working_memory(::Rimu.NoThreading, t::TVecOld)
+    return WorkingMemoryOld(t)
 end
 function Rimu.fciqmc_step!(
-    ::Rimu.NoThreading, w::WorkingMemory, ham, src::TVec, shift, dτ
+    ::Rimu.NoThreading, w::WorkingMemoryOld, ham, src::TVecOld, shift, dτ
 )
     stat_names, stats = step_stats(src, Val(1))
     style = StochasticStyle(src)
@@ -299,15 +299,15 @@ function Rimu.fciqmc_step!(
     end
     return stat_names, result
 end
-function Rimu.apply_memory_noise!(w::WorkingMemory, t::TVec, args...)
+function Rimu.apply_memory_noise!(w::WorkingMemoryOld, t::TVecOld, args...)
     return 0.0
 end
-function Rimu.sort_into_targets!(dst::TVec, w::WorkingMemory, stats)
+function Rimu.sort_into_targets!(dst::TVecOld, w::WorkingMemoryOld, stats)
     merge_rows!(w)
     synchronize!(w)
     move_and_compress!(CompressionStrategy(StochasticStyle(dst)), dst, w)
     return dst, w, stats
 end
-function Rimu.StochasticStyles.compress!(::ThresholdCompression, t::TVec)
+function Rimu.StochasticStyles.compress!(::ThresholdCompression, t::TVecOld)
     return t
 end

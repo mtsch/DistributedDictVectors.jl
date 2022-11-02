@@ -1,4 +1,4 @@
-import Rimu: StochasticStyle, deposit!
+import Rimu: StochasticStyle, deposit!, add!
 using Folds
 
 """
@@ -364,8 +364,8 @@ function LinearAlgebra.dot(left::TVec, right::TVec)
     if are_compatible(left, right)
         T = promote_type(valtype(left), valtype(right))
         result = Folds.sum(zip(left.segments, right.segments)) do (l_segs, r_segs)
-            sum(r_segs) do (k, v)
-                get(l_segs, k, zero(valtype(l_segs))) + v
+            sum(r_segs; init=zero(T)) do (k, v)
+                get(l_segs, k, zero(valtype(l_segs))) * v
             end
         end::T
     else
@@ -374,7 +374,7 @@ function LinearAlgebra.dot(left::TVec, right::TVec)
         end
     end
 
-    if is_distributed(v)
+    if is_distributed(right)
         return MPI.Allreduce(result, +, MPI.COMM_WORLD)
     else
         return result

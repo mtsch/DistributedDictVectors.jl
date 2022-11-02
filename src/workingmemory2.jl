@@ -1,4 +1,5 @@
 using Rimu.StochasticStyles: ThresholdCompression, NoCompression
+using FoldsThreads
 
 """
 
@@ -46,6 +47,27 @@ function perform_spawns!(w::WorkingMemory, t::TVec, prop)
             spawn_column!(column, prop, k, v)
         end
     end
+    #=
+    Folds.extrema(zip(w.columns, t.segments), WorkStealingEx(; basesize=1)) do (column, segment)
+        empty!(column)
+        acc = 0
+        for (k, v) in segment
+            acc += spawn_column!(column, prop, k, v)[3]
+        end
+        acc
+    end
+    =#
+    #=
+    @sync for (column, segment) in zip(w.columns, t.segments)
+        Threads.@spawn begin
+            empty!(column)
+            for (k, v) in segment
+                spawn_column!(column, prop, k, v)
+            end
+        end
+    end
+    return (0, 0)
+    =#
 end
 
 # Collect each row to its diagonal:
@@ -139,40 +161,23 @@ end
 
 
 # Rimu stuff
-function Rimu.working_memory(::Rimu.SplittablesThreading, t::TVec)
-    return WorkingMemory(t)
-end
 function Rimu.working_memory(::Rimu.NoThreading, t::TVec)
     return WorkingMemory(t)
 end
 
 function Rimu.fciqmc_step!(
-    ::Rimu.SplittablesThreading, w::WorkingMemory, ham, v::TVec, shift, dτ
-)
-    stat_names, stats = step_stats(src, Val(1))
-
-    prop = FCIQMCPropagator(ham, shift, dτ)
-    perform_spawns!(w, src, prop)
-    collect_local!(w)
-    synchronize_remote!(w)
-    move_and_compress!(dst, w)
-
-    return stat_names, stats
-end
-function Rimu.fciqmc_step!(
     ::Rimu.NoThreading, w::WorkingMemory, ham, src::TVec, shift, dτ
 )
-    stat_names, stats = step_stats(src, Val(1))
+    # stat_names, stats = step_stats(src, Val(1))
 
     prop = FCIQMCPropagator(ham, shift, dτ)
-    perform_spawns!(w, src, prop)
-    collect_local!(w)
-    synchronize_remote!(w)
-    move_and_compress!(src, w)
+    spawnzeit = @elapsed perform_spawns!(w, src, prop)
+    collzeit = @elapsed collect_local!(w)
+    synczeit = @elapsed synchronize_remote!(w)
+    compzeit = @elapsed move_and_compress!(src, w)
 
-    return stat_names, stats
+    return (:spawnzeit, :collzeit, :synczeit, :compzeit), (spawnzeit, collzeit, synczeit, compzeit)
 end
-
 
 function Rimu.apply_memory_noise!(w::WorkingMemory, t::TVec, args...)
     return 0.0
@@ -185,4 +190,45 @@ function Rimu.StochasticStyles.compress!(::ThresholdCompression, t::TVec)
 end
 function Rimu.StochasticStyles.compress!(::NoCompression, t::TVec)
     return t
+end
+
+
+
+
+using KrylovKit
+
+struct EquippedOperator{O,W}
+    operator::O
+    working_memory::W
+end
+Base.eltype(eo::EquippedOperator) = eltype(eo.operator)
+Base.eltype(::Type{<:EquippedOperator{O}}) where {O} = eltype(O)
+
+function equip(operator, vector)
+    if eltype(operator) === valtype(vector)
+        wm = WorkingMemory(vector)
+    else
+        wm = WorkingMemory(similar(vector, eltype(operator)))
+    end
+    if StochasticStyle(vector) != IsDeterministic()
+        @warn "Stochastic stochastic style used."
+    end
+    return EquippedOperator(operator, wm)
+end
+
+function (eo::EquippedOperator)(t::TVec)
+    dst = similar(t, promote_type(eltype(eo.operator), valtype(t)))
+    return mul!(dst, eo.operator, t, eo.working_memory)
+end
+
+function KrylovKit.eigsolve(
+    ham::AbstractHamiltonian, dv::TVec, howmany::Int, which::Symbol=:SR;
+    issymmetric=eltype(ham) <: Real && LOStructure(ham) === IsHermitian(),
+    ishermitian=LOStructure(ham) === IsHermitian(),
+    verbosity=0,
+    style=IsDeterministic(),
+    kwargs...
+)
+    eo = equip(ham, dv)
+    return eigsolve(eo, dv, howmany, which; issymmetric, verbosity, kwargs...)
 end
