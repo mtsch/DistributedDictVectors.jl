@@ -1,23 +1,57 @@
 using Rimu.StochasticStyles: ThresholdCompression, NoCompression
 using FoldsThreads
 
+# Basically a tvec, but not distributed
+struct WorkingMemoryColumn{K,V,W<:AbstractInitiatorValue{V},S,I<:InitiatorRule{V}}
+    segments::Vector{Dict{K,W}}
+    initiator::I
+    style::S
+end
+function WorkingMemoryColumn(t::TVec{K,V}) where {K,V}
+    n = num_segments(t) * t.mpi_size
+    W = initiator_valtype(t.initiator)
+
+    segments = [Dict{K,W}() for _ in 1:n]
+    return WorkingMemoryColumn(segments, t.initiator, t.style)
+end
+
+function deposit!(c::WorkingMemoryColumn{K,V,W}, k::K, val, parent) where {K,V,W}
+    segment_id = fastrange(hash(k), num_segments(c))
+    segment = c.segments[segment_id]
+    new_val = get(segment, k, zero(W)) + set_value(c.initiator, k, V(val), parent)
+    if iszero(new_val)
+        delete!(segment, k)
+    else
+        segment[k] = new_val
+    end
+    return nothing
+end
+StochasticStyle(c::WorkingMemoryColumn) = c.style
+Base.length(c::WorkingMemoryColumn) = sum(length, c.segments)
+Base.empty!(c::WorkingMemoryColumn) = foreach(empty!, c.segments)
+Base.keytype(::WorkingMemoryColumn{K}) where {K} = K
+Base.valtype(::WorkingMemoryColumn{<:Any,V}) where {V} = V
+num_segments(c::WorkingMemoryColumn) = length(c.segments)
+
 """
 
 Target for spawning.
 """
-struct WorkingMemory{K,V,S,D}
-    columns::Vector{TVec{K,V,S,false}}
+struct WorkingMemory{K,V,S,D,I<:InitiatorRule{V},W<:AbstractInitiatorValue{V}}
+    columns::Vector{WorkingMemoryColumn{K,V,W,S,I}}
+    initiator::I
     mpi_rank::Int
     mpi_size::Int
     # Also want send/recv buffers
 end
 
-function WorkingMemory(t::TVec{K,V,S,D}) where {K,V,S,D}
+function WorkingMemory(t::TVec{K,V,S,D,I}) where {K,V,S,D,I}
     style = t.style
     nrows = num_segments(t) * t.mpi_size
-    columns = [TVec{K,V}(; style, _mpi_size=1, _mpi_rank=0, num_segments=nrows) for _ in 1:num_segments(t)]
+    columns = [WorkingMemoryColumn(t) for _ in 1:num_segments(t)]
 
-    return WorkingMemory{K,V,S,D}(columns, t.mpi_rank, t.mpi_size)
+    W = initiator_valtype(t.initiator)
+    return WorkingMemory{K,V,S,D,I,W}(columns, t.initiator, t.mpi_rank, t.mpi_size)
 end
 
 is_distributed(::WorkingMemory{<:Any,<:Any,<:Any,D}) where {D} = D
@@ -41,33 +75,14 @@ function perform_spawns!(w::WorkingMemory, t::TVec, prop)
     if num_columns(w) ≠ num_segments(t)
         error("working memory incompatible with vector")
     end
-    Folds.foreach(zip(w.columns, t.segments)) do (column, segment)
+    _, stats = step_stats(StochasticStyle(w.columns[1]))
+    stats = Folds.sum(zip(w.columns, t.segments)) do (column, segment)
         empty!(column)
-        for (k, v) in segment
+        sum(segment; init=stats) do (k, v)
             spawn_column!(column, prop, k, v)
         end
-    end
-    #=
-    Folds.extrema(zip(w.columns, t.segments), WorkStealingEx(; basesize=1)) do (column, segment)
-        empty!(column)
-        acc = 0
-        for (k, v) in segment
-            acc += spawn_column!(column, prop, k, v)[3]
-        end
-        acc
-    end
-    =#
-    #=
-    @sync for (column, segment) in zip(w.columns, t.segments)
-        Threads.@spawn begin
-            empty!(column)
-            for (k, v) in segment
-                spawn_column!(column, prop, k, v)
-            end
-        end
-    end
-    return (0, 0)
-    =#
+    end::typeof(stats)
+    return stats
 end
 
 # Collect each row to its diagonal:
@@ -81,7 +96,7 @@ end
 # x x x      0 0 x
 function collect_local!(w::WorkingMemory)
     ncols = num_columns(w)
-    Folds.foreach(1:num_rows(w)) do i
+    foreach(1:num_rows(w)) do i
         diag_index = mod1(i, ncols)
         for j in 1:ncols
             j == diag_index && continue
@@ -106,7 +121,9 @@ function move_and_compress!(t::ThresholdCompression, dst::TVec, src::WorkingMemo
         dst_seg = dst.segments[i]
         src_seg = get_diagonal(src, i)
         empty!(dst_seg)
-        for (key, val) in pairs(src_seg)
+        for (key, ival) in pairs(src_seg)
+            val = get_value(src.initiator, ival)
+
             prob = abs(val) / t.threshold
             if prob < 1 && prob > rand()
                 dst_seg[key] = t.threshold * sign(val)
@@ -121,7 +138,10 @@ function move_and_compress!(::NoCompression, dst::TVec, src::WorkingMemory)
     Folds.foreach(1:num_segments(dst)) do i
         dst_seg = dst.segments[i]
         src_seg = get_diagonal(src, i)
-        copy!(dst_seg, src_seg)
+        empty!(dst_seg)
+        for (key, ival) in src_seg
+            dst_seg[key] = get_value(src.initiator, ival)
+        end
     end
     return dst
 end
@@ -168,15 +188,15 @@ end
 function Rimu.fciqmc_step!(
     ::Rimu.NoThreading, w::WorkingMemory, ham, src::TVec, shift, dτ
 )
-    # stat_names, stats = step_stats(src, Val(1))
+    stat_names, stats = step_stats(StochasticStyle(src))
 
     prop = FCIQMCPropagator(ham, shift, dτ)
-    spawnzeit = @elapsed perform_spawns!(w, src, prop)
-    collzeit = @elapsed collect_local!(w)
-    synczeit = @elapsed synchronize_remote!(w)
-    compzeit = @elapsed move_and_compress!(src, w)
+    stats = perform_spawns!(w, src, prop)
+    collect_local!(w)
+    synchronize_remote!(w)
+    move_and_compress!(src, w)
 
-    return (:spawnzeit, :collzeit, :synczeit, :compzeit), (spawnzeit, collzeit, synczeit, compzeit)
+    return stat_names, stats
 end
 
 function Rimu.apply_memory_noise!(w::WorkingMemory, t::TVec, args...)

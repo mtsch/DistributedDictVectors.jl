@@ -1,11 +1,4 @@
 """
-    fastrange(h, n)
-
-Map hash to to bucket in range 1:n. See [fastrange](https://github.com/lemire/fastrange).
-"""
-fastrange(h, n::Int) = (((h % UInt128) * (n % UInt128)) >> 64) % Int + 1
-
-"""
     target_capacity(curr_length)
 
 Compute the target capacity.

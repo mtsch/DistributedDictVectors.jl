@@ -8,15 +8,17 @@ Map hash to to bucket in range 1:n. See [fastrange](https://github.com/lemire/fa
 """
 fastrange(h, n::Int) = (((h % UInt128) * (n % UInt128)) >> 64) % Int + 1
 
-struct TVec{K,V,S,D} <: AbstractDVec{K,V}
+struct TVec{K,V,S,D,I<:InitiatorRule{V}} <: AbstractDVec{K,V}
     segments::Vector{Dict{K,V}}
     style::S
+    initiator::I
     mpi_rank::Int
     mpi_size::Int
 end
 
 function TVec{K,V}(
     ; style=default_style(V), num_segments=Threads.nthreads(),
+    initiator=false, initiator_threshold=1,
     _mpi_rank=nothing, # debugging only
     _mpi_size=nothing, # debugging only
 ) where{K,V}
@@ -27,7 +29,19 @@ function TVec{K,V}(
 
     segments = [Dict{K,V}() for _ in 1:num_segments]
 
-    return TVec{K,V,typeof(style),mpi_size > 1}(segments, style, mpi_rank, mpi_size)
+    if initiator == false
+        irule = NoInitiator{V}()
+    elseif initiator == true
+        irule = Initiator{V}(V(initiator_threshold))
+    elseif initiator == :eco
+        irule = EcoInitiator{V}(V(initiator_threshold))
+    elseif initiator isa InitiatorRule
+        irule = initiator
+    else
+        throw(ArgumentError("Invalid initiator $initiator"))
+    end
+
+    return TVec{K,V,typeof(style),mpi_size > 1,typeof(irule)}(segments, style, irule, mpi_rank, mpi_size)
 end
 function TVec(pairs; kwargs...)
     keys = getindex.(pairs, 1) # to get eltypes
@@ -149,14 +163,16 @@ end
 ###
 ### empty(!), similar, copy, etc.
 ###
-function Base.empty(t::TVec{K,V}; style=t.style) where {K,V}
-    return TVec{K,V}(; style, num_segments=num_segments(t))
+function Base.empty(t::TVec{K,V}; style=t.style, initiator=t.initiator) where {K,V}
+    return TVec{K,V}(; style, initiator, num_segments=num_segments(t))
 end
-function Base.empty(t::TVec{K}, ::Type{V}; style=t.style) where {K,V}
-    return TVec{K,V}(; style, num_segments=num_segments(t))
+function Base.empty(t::TVec{K}, ::Type{V}; style=t.style, initiator=t.initiator) where {K,V}
+    return TVec{K,V}(; style, initiator, num_segments=num_segments(t))
 end
-function Base.empty(t::TVec, ::Type{K}, ::Type{V}; style=t.style) where {K,V}
-    return TVec{K,V}(; style, num_segments=num_segments(t))
+function Base.empty(
+    t::TVec, ::Type{K}, ::Type{V}; style=t.style, initiator=t.initiator
+) where {K,V}
+    return TVec{K,V}(; style, initiator, num_segments=num_segments(t))
 end
 Base.similar(t::TVec, args...; kwargs...) = empty(t, args...; kwargs...)
 

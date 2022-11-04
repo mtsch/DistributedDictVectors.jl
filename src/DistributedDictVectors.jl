@@ -6,6 +6,7 @@ using Folds
 using KrylovKit
 using LinearAlgebra
 
+include("initiators.jl")
 include("tvec2.jl")
 include("workingmemory2.jl")
 
