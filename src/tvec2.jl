@@ -8,24 +8,19 @@ Map hash to to bucket in range 1:n. See [fastrange](https://github.com/lemire/fa
 """
 fastrange(h, n::Int) = (((h % UInt128) * (n % UInt128)) >> 64) % Int + 1
 
-struct TVec{K,V,S,D,I<:InitiatorRule{V}} <: AbstractDVec{K,V}
+struct TVec{K,V,S,I<:InitiatorRule{V},C<:AbstractCommunicator} <: AbstractDVec{K,V}
     segments::Vector{Dict{K,V}}
     style::S
     initiator::I
-    mpi_rank::Int
-    mpi_size::Int
+    communicator::C
 end
 
 function TVec{K,V}(
     ; style=default_style(V), num_segments=Threads.nthreads(),
     initiator=false, initiator_threshold=1,
-    _mpi_rank=nothing, # debugging only
-    _mpi_size=nothing, # debugging only
+    communicator=nothing,
 ) where{K,V}
     comm = MPI.COMM_WORLD
-
-    mpi_rank = isnothing(_mpi_rank) ? MPI.Comm_rank(comm) : _mpi_rank
-    mpi_size = isnothing(_mpi_size) ? MPI.Comm_size(comm) : _mpi_size
 
     segments = [Dict{K,V}() for _ in 1:num_segments]
 
@@ -41,7 +36,23 @@ function TVec{K,V}(
         throw(ArgumentError("Invalid initiator $initiator"))
     end
 
-    return TVec{K,V,typeof(style),mpi_size > 1,typeof(irule)}(segments, style, irule, mpi_rank, mpi_size)
+    # This is a bit clunky. If you modify the communicator by hand, you have to make sure it
+    # knows to hold values of type W. When we introduce more communicators, they should
+    # probably be constructed by a function, similar to how it's done in RMPI.
+    W = initiator_valtype(irule)
+    if isnothing(communicator)
+        if MPI.Comm_size(MPI.COMM_WORLD) > 1
+            comm = PointToPoint{K,W}()
+        else
+            comm = NotDistributed()
+        end
+    elseif communicator isa AbstractCommunicator
+        comm = communicator
+    else
+        throw(ArgumentError("Invalid communicator $communicator"))
+    end
+
+    return TVec(segments, style, irule, comm)
 end
 function TVec(pairs; kwargs...)
     keys = getindex.(pairs, 1) # to get eltypes
@@ -59,18 +70,14 @@ end
 ###
 ### Properties and utilities
 ###
-is_distributed(::TVec{<:Any,<:Any,<:Any,D}) where {D} = D
+is_distributed(t::TVec) = is_distributed(t.communicator)
 num_segments(t::TVec) = length(t.segments)
 each_segment(t::TVec) = eachindex(t.segments)
 StochasticStyle(t::TVec) = t.style
 
 function Base.length(t::TVec)
     result = sum(length, t.segments)
-    if is_distributed(t)
-        return MPI.Allreduce(result, +, MPI.COMM_WORLD)
-    else
-        return result
-    end
+    return reduce_remote(t.communicator, +, result)
 end
 
 Base.isempty(t::TVec) = iszero(length(t))
@@ -99,11 +106,7 @@ function Base.isequal(t::TVec, u::TVec)
     else
         result = false
     end
-    if is_distributed(t)
-        return MPI.Allreduce(result, &, MPI.COMM_WORLD)
-    else
-        return result
-    end
+    return reduce_remote(t.communicator, &, result)
 end
 
 """
@@ -113,14 +116,7 @@ Determine the target segment from key hash. For MPI distributed vectors, this ma
 numbers that are out of range.
 """
 function target_segment(t::TVec{K}, k::K) where {K}
-    total_segments = num_segments(t) * t.mpi_size
-    h = hash(k)
-    if is_distributed(t)
-        segment_id = fastrange(h, total_segments) - t.mpi_rank * num_segments(t)
-        return segment_id, 1 ≤ segment_id ≤ num_segments(t)
-    else
-        return fastrange(h, total_segments), true
-    end
+    return target_segment(t.communicator, hash(k), num_segments(t))
 end
 
 ###
@@ -163,16 +159,22 @@ end
 ###
 ### empty(!), similar, copy, etc.
 ###
-function Base.empty(t::TVec{K,V}; style=t.style, initiator=t.initiator) where {K,V}
-    return TVec{K,V}(; style, initiator, num_segments=num_segments(t))
-end
-function Base.empty(t::TVec{K}, ::Type{V}; style=t.style, initiator=t.initiator) where {K,V}
-    return TVec{K,V}(; style, initiator, num_segments=num_segments(t))
+function Base.empty(
+    t::TVec{K,V}; style=t.style, initiator=t.initiator, communicator=t.communicator,
+) where {K,V}
+    return TVec{K,V}(; style, initiator, communicator, num_segments=num_segments(t))
 end
 function Base.empty(
-    t::TVec, ::Type{K}, ::Type{V}; style=t.style, initiator=t.initiator
+    t::TVec{K}, ::Type{V};
+    style=t.style, initiator=t.initiator, communicator=t.communicator,
 ) where {K,V}
-    return TVec{K,V}(; style, initiator, num_segments=num_segments(t))
+    return TVec{K,V}(; style, initiator, communicator, num_segments=num_segments(t))
+end
+function Base.empty(
+    t::TVec, ::Type{K}, ::Type{V};
+    style=t.style, initiator=t.initiator, communicator=t.communicator,
+) where {K,V}
+    return TVec{K,V}(; style, initiator, communicator, num_segments=num_segments(t))
 end
 Base.similar(t::TVec, args...; kwargs...) = empty(t, args...; kwargs...)
 
@@ -211,16 +213,18 @@ end
 ###
 ### Iterators, map, mapreduce
 ###
-struct TVecIterator{F,S,T,D}
+struct TVecIterator{F,S,T,C}
     selector::F
     segments::S
+    communicator::C
 
     function TVecIterator(selector::F, ::Type{T}, t::TVec) where {F,T}
-        return new{F,typeof(t.segments),T,is_distributed(t)}(selector, t.segments)
+        C = typeof(t.communicator)
+        return new{F,typeof(t.segments),T,C}(selector, t.segments, t.communicator)
     end
 end
 
-is_distributed(t::TVecIterator{<:Any,<:Any,<:Any,D}) where {D} = D
+is_distributed(t::TVecIterator) = is_distributed(t.communicator)
 Base.eltype(t::Type{<:TVecIterator{<:Any,<:Any,T}}) where {T} = T
 Base.length(t::TVecIterator) = sum(length, t.segments)
 
@@ -238,8 +242,7 @@ Base.pairs(t::TVec) = TVecIterator(pairs, eltype(t), t)
 
 function Base.iterate(t::TVecIterator, segment_id::Int=1)
     if is_distributed(t)
-        # TODO should error?
-        @warn "Vector is distributed, iterating over local entries only." maxlog=1
+        @warn "Vector is distributed, iterating over local entries only."
     end
     if segment_id > length(t.segments)
         return nothing
@@ -264,11 +267,7 @@ function Base.mapreduce(f, op, t::TVecIterator; kwargs...)
     result = Folds.mapreduce(op, t.segments; kwargs...) do segment
         mapreduce(f, op, t.selector(segment))
     end
-    if is_distributed(t)
-        return MPI.Allreduce(result, op, MPI.COMM_WORLD)
-    else
-        return result
-    end
+    return reduce_remote(t.communicator, op, result)
 end
 function Base.map!(f, t::TVecVals)
     Folds.foreach(t.segments) do segment
@@ -344,8 +343,8 @@ function LinearAlgebra.mul!(dst::TVec, src::TVec, α::Number)
     return map!(x -> α * x, dst, values(src))
 end
 
-function add!(d::Dict, s::Dict, α=true)
-    for (key, s_value) in pairs(s)
+function add!(d::Dict, s, α=true)
+    for (key, s_value) in s
         d_value = get(d, key, zero(valtype(d)))
         new_value = d_value + α * s_value
         if iszero(new_value)
@@ -389,12 +388,7 @@ function LinearAlgebra.dot(left::TVec, right::TVec)
             left[k] + v
         end
     end
-
-    if is_distributed(right)
-        return MPI.Allreduce(result, +, MPI.COMM_WORLD)
-    else
-        return result
-    end
+    return reduce_remote(right.communicator, +, result)
 end
 
 function Base.real(v::TVec)

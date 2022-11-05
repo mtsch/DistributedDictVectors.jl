@@ -1,3 +1,5 @@
+#TODO DONT NEED DAT
+using Rimu.RMPI
 using Rimu.StochasticStyles: ThresholdCompression, NoCompression
 using FoldsThreads
 
@@ -8,7 +10,7 @@ struct WorkingMemoryColumn{K,V,W<:AbstractInitiatorValue{V},S,I<:InitiatorRule{V
     style::S
 end
 function WorkingMemoryColumn(t::TVec{K,V}) where {K,V}
-    n = num_segments(t) * t.mpi_size
+    n = total_num_segments(t.communicator, num_segments(t))
     W = initiator_valtype(t.initiator)
 
     segments = [Dict{K,W}() for _ in 1:n]
@@ -18,7 +20,7 @@ end
 function deposit!(c::WorkingMemoryColumn{K,V,W}, k::K, val, parent) where {K,V,W}
     segment_id = fastrange(hash(k), num_segments(c))
     segment = c.segments[segment_id]
-    new_val = get(segment, k, zero(W)) + set_value(c.initiator, k, V(val), parent)
+    new_val = get(segment, k, zero(W)) + to_initiator_value(c.initiator, k, V(val), parent)
     if iszero(new_val)
         delete!(segment, k)
     else
@@ -32,43 +34,56 @@ Base.empty!(c::WorkingMemoryColumn) = foreach(empty!, c.segments)
 Base.keytype(::WorkingMemoryColumn{K}) where {K} = K
 Base.valtype(::WorkingMemoryColumn{<:Any,V}) where {V} = V
 num_segments(c::WorkingMemoryColumn) = length(c.segments)
+segment_type(::Type{<:WorkingMemoryColumn{K,<:Any,W}}) where {K,W} = Dict{K,W}
 
 """
 
 Target for spawning.
 """
-struct WorkingMemory{K,V,S,D,I<:InitiatorRule{V},W<:AbstractInitiatorValue{V}}
+struct WorkingMemory{
+    K,V,W<:AbstractInitiatorValue{V},S,I<:InitiatorRule{V},C<:AbstractCommunicator
+}
     columns::Vector{WorkingMemoryColumn{K,V,W,S,I}}
     initiator::I
-    mpi_rank::Int
-    mpi_size::Int
-    # Also want send/recv buffers
+    communicator::C
 end
 
 function WorkingMemory(t::TVec{K,V,S,D,I}) where {K,V,S,D,I}
     style = t.style
-    nrows = num_segments(t) * t.mpi_size
+    nrows = total_num_segments(t.communicator, num_segments(t))
     columns = [WorkingMemoryColumn(t) for _ in 1:num_segments(t)]
 
     W = initiator_valtype(t.initiator)
-    return WorkingMemory{K,V,S,D,I,W}(columns, t.initiator, t.mpi_rank, t.mpi_size)
+    return WorkingMemory(columns, t.initiator, t.communicator)
 end
 
-is_distributed(::WorkingMemory{<:Any,<:Any,<:Any,D}) where {D} = D
 num_rows(w::WorkingMemory) = length(w.columns[1].segments)
 num_columns(w::WorkingMemory) = length(w.columns)
 
 function Base.length(w::WorkingMemory)
     result = sum(length, w.columns)
-    if is_distributed(w)
-        return MPI.Allreduce(result, +, MPI.COMM_WORLD)
-    else
-        return result
-    end
+    return reduce_remote(w.communicator, +, result)
 end
 
-function get_diagonal(w::WorkingMemory, index)
-    w.columns[index].segments[index + w.mpi_rank * num_columns(w)]
+function diagonal_segment(w::WorkingMemory, index)
+    i, j = diagonal_segment(w.communicator, num_columns(w), index)
+    w.columns[i].segments[j]
+end
+
+struct RemoteSegmentIterator{W,D} <: AbstractVector{D}
+    working_memory::W
+    rank::Int
+end
+function remote_segments(w::WorkingMemory, rank)
+    return RemoteSegmentIterator{typeof(w),segment_type(eltype(w.columns))}(w, rank)
+end
+function local_segments(w::WorkingMemory)
+    rank = rank_id(w.communicator)
+    return RemoteSegmentIterator{typeof(w),segment_type(eltype(w.columns))}(w, rank)
+end
+Base.size(it::RemoteSegmentIterator) = (num_columns(it.working_memory),)
+function Base.getindex(it::RemoteSegmentIterator, i)
+    return diagonal_segment(it.working_memory, i + it.rank * num_columns(it.working_memory))
 end
 
 function perform_spawns!(w::WorkingMemory, t::TVec, prop)
@@ -96,7 +111,7 @@ end
 # x x x      0 0 x
 function collect_local!(w::WorkingMemory)
     ncols = num_columns(w)
-    foreach(1:num_rows(w)) do i
+    Folds.foreach(1:num_rows(w)) do i
         diag_index = mod1(i, ncols)
         for j in 1:ncols
             j == diag_index && continue
@@ -105,11 +120,7 @@ function collect_local!(w::WorkingMemory)
     end
 end
 function synchronize_remote!(w::WorkingMemory)
-    if !is_distributed(w)
-        return w
-    else
-        error("NOT IMPLEMENTED YET SOWWY")
-    end
+    synchronize_remote!(w.communicator, w)
 end
 
 function move_and_compress!(dst::TVec, src::WorkingMemory)
@@ -117,12 +128,11 @@ function move_and_compress!(dst::TVec, src::WorkingMemory)
     return move_and_compress!(compression, dst, src)
 end
 function move_and_compress!(t::ThresholdCompression, dst::TVec, src::WorkingMemory)
-    Folds.foreach(1:num_segments(dst)) do i
-        dst_seg = dst.segments[i]
-        src_seg = get_diagonal(src, i)
+    Folds.foreach(zip(dst.segments, local_segments(src))) do (dst_seg, src_seg)
         empty!(dst_seg)
+        # TODO as move_and_compress(::Dict, ::Dict)
         for (key, ival) in pairs(src_seg)
-            val = get_value(src.initiator, ival)
+            val = from_initiator_value(src.initiator, ival)
 
             prob = abs(val) / t.threshold
             if prob < 1 && prob > rand()
@@ -135,12 +145,11 @@ function move_and_compress!(t::ThresholdCompression, dst::TVec, src::WorkingMemo
     return dst
 end
 function move_and_compress!(::NoCompression, dst::TVec, src::WorkingMemory)
-    Folds.foreach(1:num_segments(dst)) do i
-        dst_seg = dst.segments[i]
-        src_seg = get_diagonal(src, i)
+    Folds.foreach(zip(dst.segments, local_segments(src))) do (dst_seg, src_seg)
         empty!(dst_seg)
+        # TODO as move_and_compress(::Dict, ::Dict)
         for (key, ival) in src_seg
-            dst_seg[key] = get_value(src.initiator, ival)
+            dst_seg[key] = from_initiator_value(src.initiator, ival)
         end
     end
     return dst
@@ -193,6 +202,7 @@ function Rimu.fciqmc_step!(
     prop = FCIQMCPropagator(ham, shift, dτ)
     stats = perform_spawns!(w, src, prop)
     collect_local!(w)
+
     synchronize_remote!(w)
     move_and_compress!(src, w)
 
@@ -238,15 +248,14 @@ end
 
 function (eo::EquippedOperator)(t::TVec)
     dst = similar(t, promote_type(eltype(eo.operator), valtype(t)))
-    return mul!(dst, eo.operator, t, eo.working_memory)
+    res = mul!(dst, eo.operator, t, eo.working_memory)
+    return res
 end
 
 function KrylovKit.eigsolve(
     ham::AbstractHamiltonian, dv::TVec, howmany::Int, which::Symbol=:SR;
     issymmetric=eltype(ham) <: Real && LOStructure(ham) === IsHermitian(),
-    ishermitian=LOStructure(ham) === IsHermitian(),
     verbosity=0,
-    style=IsDeterministic(),
     kwargs...
 )
     eo = equip(ham, dv)
