@@ -1,273 +1,525 @@
+import Rimu: StochasticStyle, deposit!, add!
+using Folds
 
-_mod1(x, y) = mod1(x, y)#mod(x, y) + 0x1
+"""
+    fastrange_hash(k, n)
 
-struct TVecOld{
-    K,V,D<:Storage{K,V},A<:AbstractVector{D},S<:StochasticStyle,
-    NR,ID
-} <: AbstractDVec{K,V}
-    segments::A
-    style::S
-end
-
-function TVecOld{K,V}(
-    ; style=default_style(V), num_segments=4,
-    _num_ranks=nothing,
-    _rank_id=nothing,
-) where {K,V}
-    comm = MPI.COMM_WORLD
-
-    # Setting the following only supported for debugging.
-    num_ranks = isnothing(_num_ranks) ? MPI.Comm_size(comm) : _num_ranks
-    rank_id = isnothing(_rank_id) ? MPI.Comm_rank(comm) : _rank_id
-    tot_segments = num_segments * Threads.nthreads() #Threads.nthreads() > 1 ? num_segments * Threads.nthreads() : 1
-    segments = [Storage{K,V}() for _ in 1:tot_segments]
-
-    TVecOld{K,V,eltype(segments),typeof(segments),typeof(style),num_ranks,rank_id}(
-        segments, style
-    )
-end
-function TVecOld(ps::Vararg{Pair{K,V}}; kwargs...) where {K,V}
-    t = TVecOld{K,V}(; kwargs...)
-    for (k, v) in ps
-        t[k] = v
-    end
-    return t
-end
-function TVecOld(pairs; kwargs...)
-    K = typeof(first(pairs)[1])
-    V = typeof(first(pairs)[2])
-    t = TVecOld{K,V}(; kwargs...)
-    for (k, v) in pairs
-        t[k] = v
-    end
-    return t
-end
-
-# Properties
-rank_id(t::TVecOld{<:Any,<:Any,<:Any,<:Any,<:Any,<:Any,ID}) where {ID} = ID
-num_ranks(t::TVecOld{<:Any,<:Any,<:Any,<:Any,<:Any,NR}) where {NR} = NR
-is_distributed(t::TVecOld) = num_ranks(t) > 1
-num_segments(t::TVecOld) = length(t.segments)
-Rimu.StochasticStyle(s::TVecOld) = s.style
-
-function Base.length(s::TVecOld)
-    if is_distributed(s)
-        MPI.Allreduce(sum(length, s.segments), +, MPI.COMM_WORLD)
-    else
-        sum(length, s.segments)
-    end
-end
-
-function Base.copyto!(dst::TVecOld, src::TVecOld)
-    if num_segments(dst) == num_segments(src)
-        Folds.foreach(enumerate(src.segments)) do (i, s_s)
-            copy!(dst.segments[i], s_s)
-        end
-        return dst
-    else
-        # Mismatched number of segments - copy by moving each element over.
-        return invoke(copyto!, Tuple{AbstractDVec, TVecOld}, dst, src)
-    end
-end
-function Base.copy!(dst::TVecOld, src::TVecOld)
-    return copyto!(dst, src)
-end
-function Base.copy(dst::TVecOld, src::TVecOld)
-    return copy!(empty(dst), src)
+Map `k` to to bucket in range 1:n. See [fastrange](https://github.com/lemire/fastrange).
+"""
+function fastrange_hash(k, n::Int)
+    h = hash(k)
+    return (((h % UInt128) * (n % UInt128)) >> 64) % Int + 1
 end
 
 """
-     target_segment(t::TVecOld, hash::UInt64)
+    TVec{K,V}(; kwargs...)
+    TVec(iter; kwargs...)
+    TVec(pairs...; kwargs...)
+
+Dictionary-based vector-like data structure for use with FCIQMC and
+[KrylovKit.jl](https://github.com/Jutho/KrylovKit.jl). While mostly behaving like a Dict, it
+supports various linear algebra operations such as `norm` and `dot`.
+
+# Keyword arguments
+
+* `style = `[`default_style`](@ref)`(V)`: A [`StochasticStyle`](@ref) that is used to select
+  the spawning startegy in the FCIQMC algorithm.
+
+* `initiator = `[`NoInitiator`](@ref)`()`: An [`InitiatorRule`](@ref), used in FCIQMC to
+  remove the sign problem.
+
+* `communicator`: A [`Communicator`](@ref) that controls how operations are performed when
+  using MPI. The defaults are [`NotDistributed`](@ref) when not using MPI and
+  [`PointToPoint`](@ref) when using MPI.
+
+* `num_segments = Threads.nthreads()`: Number of segments to divide the vector into. This is
+  best left at its default value. See the extended help for more info.
+
+* `executor = Folds.ThreadedEx()`: Experimental. Change the executor to use. See
+  [FoldsThreads.jl](https://juliafolds.github.io/FoldsThreads.jl/dev/) for more info on
+  executors.
+
+# Extended Help
+
+* Explain why/how it is segmented
+* Explain iteration / reductions / localpart
+
+"""
+struct TVec{
+    K,V,S,I<:InitiatorRule{V},C<:AbstractCommunicator,E
+} <: AbstractDVec{K,V}
+    segments::Vector{Dict{K,V}}
+    style::S
+    initiator::I
+    communicator::C
+    executor::E
+end
+
+function TVec{K,V}(
+    ; style=default_style(V), num_segments=Threads.nthreads(),
+    initiator=false, initiator_threshold=1,
+    communicator=nothing,
+    executor=nothing,
+) where{K,V}
+    segments = [Dict{K,V}() for _ in 1:num_segments]
+
+    if initiator == false
+        irule = NoInitiator{V}()
+    elseif initiator == true
+        irule = Initiator{V}(V(initiator_threshold))
+    elseif initiator == :eco
+        irule = EcoInitiator{V}(V(initiator_threshold))
+    elseif initiator isa InitiatorRule
+        irule = initiator
+    else
+        throw(ArgumentError("Invalid initiator $initiator"))
+    end
+
+    # This is a bit clunky. If you modify the communicator by hand, you have to make sure it
+    # knows to hold values of type W. When we introduce more communicators, they should
+    # probably be constructed by a function, similar to how it's done in RMPI.
+    W = initiator_valtype(irule)
+    if isnothing(communicator)
+        if MPI.Comm_size(MPI.COMM_WORLD) > 1
+            comm = PointToPoint{K,W}()
+        else
+            comm = NotDistributed()
+        end
+    elseif communicator isa AbstractCommunicator
+        comm = communicator
+    else
+        throw(ArgumentError("Invalid communicator $communicator"))
+    end
+
+    if isnothing(executor)
+        if Threads.nthreads() == 1 || num_segments == 1
+            ex = NonThreadedEx()
+        else
+            ex = ThreadedEx()
+        end
+    else
+        ex = executor
+    end
+
+    return TVec(segments, style, irule, comm, ex)
+end
+function TVec(pairs; kwargs...)
+    keys = getindex.(pairs, 1) # to get eltypes
+    vals = getindex.(pairs, 2)
+    t = TVec{eltype(keys),eltype(vals)}(; kwargs...)
+    for (k, v) in zip(keys, vals)
+        t[k] = v
+    end
+    return t
+end
+function TVec(pairs::Vararg{Pair}; kwargs...)
+    return TVec(pairs; kwargs...)
+end
+
+function Base.summary(io::IO, t::TVec)
+    len = length(t)
+    print(io, "$len-element")
+    if num_segments(t) ≠ Threads.nthreads()
+        print(io, ", ", num_segments(t), "-segment")
+    end
+    if t.communicator isa LocalPart
+        print(io, " localpart(TVec): ")
+        comm = t.communicator.communicator
+    else
+        print(io, " TVec: ")
+        comm = t.communicator
+    end
+    print(io, "style = ", t.style)
+    if t.initiator ≠ NoInitiator{valtype(t)}()
+        print(io, ", initiator=", t.initiator)
+    end
+    if comm ≠ NotDistributed()
+        print(io, ", communicator=", t.communicator)
+    end
+end
+
+###
+### Properties and utilities
+###
+is_distributed(t::TVec) = is_distributed(t.communicator)
+num_segments(t::TVec) = length(t.segments)
+each_segment(t::TVec) = eachindex(t.segments)
+StochasticStyle(t::TVec) = t.style
+
+function Base.length(t::TVec)
+    result = sum(length, t.segments)
+    return reduce_remote(t.communicator, +, result)
+end
+
+Base.isempty(t::TVec) = iszero(length(t))
+
+function are_compatible(t, u)
+    if length(t.segments) == length(u.segments)
+        return true
+    else
+        @warn "vectors have different numbers of segments. This prevents parallelization." maxlog=1
+        return false
+    end
+end
+
+function Base.isequal(t::TVec, u::TVec)
+    if are_compatible(t, u)
+        result = Folds.all(zip(t.segments, u.segments), u.executor) do (t_seg, u_seg)
+            isequal(t_seg, u_seg)
+        end
+    elseif length(t) == length(u)
+        result = Folds.all(u.segments, u.executor) do seg
+            for (k, v) in seg
+                isequal(t[k], v) || return false
+            end
+            return true
+        end
+    else
+        result = false
+    end
+    return reduce_remote(t.communicator, &, result)
+end
+
+"""
+     target_segment(t::TVec, k)
 
 Determine the target segment from key hash. For MPI distributed vectors, this may return
 numbers that are out of range.
 """
-function target_segment(t, hash::UInt64)
-    total_segments = num_segments(t) * num_ranks(t)
-    return _mod1(hash, total_segments) % Int - rank_id(t) * num_segments(t)
+function target_segment(t::TVec{K}, k::K) where {K}
+    return target_segment(t.communicator, k, num_segments(t))
 end
 
-function Base.getindex(t::TVecOld{K}, key::K) where {K}
-    h = hash(key)
-    target = target_segment(t, h)
-    if 1 ≤ target ≤ num_segments(t)
-        getindex(t.segments[target_segment(t, h)], key, h)
+###
+### getting and setting
+###
+function Base.getindex(t::TVec{K,V}, k::K) where {K,V}
+    segment_id, is_local = target_segment(t, k)
+    if is_local
+        return get(t.segments[segment_id], k, zero(V))
     else
-        error("attempted to `getindex` from different MPI rank")
+        error("Attempted to access non-local key `$k`")
     end
 end
-
-function Base.setindex!(t::TVecOld{K,V}, val, key::K) where {K,V}
-    h = hash(key)
-    target = target_segment(t, h)
-    if 1 ≤ target ≤ num_segments(t)
-        return setindex!(t.segments[target_segment(t, h)], V(val), key, h)
-    else
-        return V(val)
+function Base.setindex!(t::TVec{K,V}, val, k::K) where {K,V}
+    v = V(val)
+    segment_id, is_local = target_segment(t, k)
+    if is_local
+        if iszero(v)
+            delete!(t.segments[segment_id], k)
+        else
+            t.segments[segment_id][k] = v
+        end
     end
+    return v
 end
-function Rimu.deposit!(t::TVecOld{K,V}, key::K, val, parent) where {K,V}
-    h = hash(key)
-    target = target_segment(t, h)
-    if 1 ≤ target ≤ num_segments(t)
-        deposit!(t.segments[target_segment(t, h)], key, V(val), h, parent)
+function deposit!(t::TVec{K,V}, k::K, val, parent=nothing) where {K,V}
+    iszero(val) && return nothing
+    segment_id, is_local = target_segment(t, k)
+    if is_local
+        segment = t.segments[segment_id]
+        new_val = get(segment, k, zero(V)) + V(val)
+        if iszero(new_val)
+            delete!(segment, k)
+        else
+            segment[k] = new_val
+        end
     end
     return nothing
 end
 
 ###
-### empty(!)
+### empty(!), similar, copy, etc.
 ###
-function Base.empty(s::TVecOld{K,V}; style=s.style) where {K,V}
-    return TVecOld{K,V}(; style, num_segments=num_segments(s) ÷ Threads.nthreads())
+function Base.empty(
+    t::TVec{K,V}; style=t.style, initiator=t.initiator, communicator=t.communicator,
+) where {K,V}
+    return TVec{K,V}(; style, initiator, communicator, num_segments=num_segments(t))
 end
-function Base.empty(s::TVecOld{K}, ::Type{V}; style=s.style) where {K,V}
-    return TVecOld{K,V}(; style, num_segments=num_segments(s) ÷ Threads.nthreads())
+function Base.empty(
+    t::TVec{K}, ::Type{V};
+    style=t.style, initiator=t.initiator, communicator=t.communicator,
+) where {K,V}
+    return TVec{K,V}(; style, initiator, communicator, num_segments=num_segments(t))
 end
-function Base.empty(s::TVecOld, ::Type{K}, ::Type{V}; style=s.style) where {K,V}
-    return TVecOld{K,V}(; style, num_segments=num_segments(s) ÷ Threads.nthreads())
+function Base.empty(
+    t::TVec, ::Type{K}, ::Type{V};
+    style=t.style, initiator=t.initiator, communicator=t.communicator,
+) where {K,V}
+    return TVec{K,V}(; style, initiator, communicator, num_segments=num_segments(t))
+end
+Base.similar(t::TVec, args...; kwargs...) = empty(t, args...; kwargs...)
+
+function Base.empty!(t::TVec)
+    Folds.foreach(empty!, t.segments, t.executor)
+    return t
 end
 
-function Base.empty!(s::TVecOld)
-    Folds.foreach(empty!, s.segments)
-    return s
+function Base.sizehint!(t::TVec, n)
+    n_per_segment = cld(n, length(t.segments))
+    Folds.foreach(d -> sizehint!(d, n_per_segment), t.segments, t.executor)
+    return t
 end
-function Base.sizehint!(s::TVecOld, n)
-    n_per_segment = cld(n, length(s.segments))
-    Folds.foreach(d -> sizehint!(d, n_per_segment), s.segments)
-    return s
+
+function Base.copyto!(dst::TVec, src::TVec)
+    if are_compatible(dst, src)
+        Folds.foreach(dst.segments, src.segments, src.executor) do d_seg, s_seg
+            copy!(d_seg, s_seg)
+        end
+        return dst
+    else
+        empty!(dst)
+        for (k, v) in pairs(src)
+            dst[k] = v
+        end
+    end
+    return dst
+end
+function Base.copy!(dst::TVec, src::TVec)
+    return copyto!(dst, src)
+end
+function Base.copy(src::TVec)
+    return copy!(empty(src), src)
+end
+function Rimu.localpart(t::TVec{K,V,S,I,<:Any,E}) where {K,V,S,I,E}
+    return TVec{K,V,S,I,LocalPart,E}(
+        t.segments, t.style, t.initiator, LocalPart(t.communicator), t.executor
+    )
 end
 
 ###
-### Iterators and parallel reduction
+### Iterators, map, mapreduce
 ###
-struct TVecOldIterator{F,V,T,D}
-    fun::F
-    segments::V
+struct TVecIterator{F,S,T,C,E}
+    selector::F
+    segments::S     # <- TODO: instead of those just store the vector
+    communicator::C
+    executor::E
 
-    function TVecOldIterator(fun::F, ::Type{T}, tv::TVecOld) where {F,T}
-        return new{F,typeof(tv.segments),T,is_distributed(tv)}(fun, tv.segments)
+    function TVecIterator(selector::F, ::Type{T}, t::TVec) where {F,T}
+        C = typeof(t.communicator)
+        E = typeof(t.executor)
+        return new{F,typeof(t.segments),T,C,E}(
+            selector, t.segments, t.communicator, t.executor
+        )
     end
 end
-Base.values(s::TVecOld) = TVecOldIterator(values, valtype(s), s)
-Base.keys(s::TVecOld) = TVecOldIterator(keys, keytype(s), s)
-Base.pairs(s::TVecOld) = TVecOldIterator(pairs, eltype(s), s)
 
-Base.eltype(s::Type{<:TVecOldIterator{<:Any,<:Any,T}}) where {T} = T
-Base.length(s::TVecOldIterator) = sum(length, s.segments)
-is_distributed(s::TVecOldIterator{<:Any,<:Any,<:Any,D}) where {D} = D
+is_distributed(t::TVecIterator) = is_distributed(t.communicator)
+Base.eltype(t::Type{<:TVecIterator{<:Any,<:Any,T}}) where {T} = T
+Base.length(t::TVecIterator) = sum(length, t.segments)
 
-function Base.iterate(s::TVecOldIterator, i::Int=1)
-    if is_distributed(s)
-        @warn "Vector is distributed, iterating over local entries only." maxlog=1
+const TVecKeys{S,T,D} = TVecIterator{typeof(keys),S,T,D}
+const TVecVals{S,T,D} = TVecIterator{typeof(values),S,T,D}
+const TVecPairs{S,T,D} = TVecIterator{typeof(pairs),S,T,D}
+
+Base.show(io::IO, t::TVecKeys) = print(io, "TVecKeys{", eltype(t), "}(...)")
+Base.show(io::IO, t::TVecVals) = print(io, "TVecVals{", eltype(t), "}(...)")
+Base.show(io::IO, t::TVecPairs) = print(io, "TVecPairs{", eltype(t), "}(...)")
+
+Base.keys(t::TVec) = TVecIterator(keys, keytype(t), t)
+Base.values(t::TVec) = TVecIterator(values, valtype(t), t)
+Base.pairs(t::TVec) = TVecIterator(pairs, eltype(t), t)
+
+function Base.iterate(t::TVecIterator)
+    if t.communicator isa NotDistributed
+        # TODO: this may be a bit annoying.
+        @warn "iteration is not supported. Please use `localpart`."
+    elseif !(t.communicator isa LocalPart)
+        throw(CommunicatorError(
+            "iteration over distributed vectors is not supported.",
+            "Use `localpart` to iterate over the local part only."
+        ))
     end
-    if i > length(s.segments)
+    return iterate(t, 1)
+end
+function Base.iterate(t::TVecIterator, segment_id::Int)
+    if segment_id > length(t.segments)
         return nothing
     end
-    it = iterate(s.fun(s.segments[i]))
+    it = iterate(t.selector(t.segments[segment_id]))
     if isnothing(it)
-        return iterate(s, i + 1)
+        return iterate(t, segment_id + 1)
     else
-        return it[1], (i, it[2])
+        return it[1], (segment_id, it[2])
     end
 end
-function Base.iterate(s::TVecOldIterator, (i, st))
-    it = iterate(s.fun(s.segments[i]), st)
+function Base.iterate(t::TVecIterator, (segment_id, state))
+    it = iterate(t.selector(t.segments[segment_id]), state)
     if isnothing(it)
-        return iterate(s, i + 1)
+        return iterate(t, segment_id + 1)
     else
-        return it[1], (i, it[2])
+        return it[1], (segment_id, it[2])
     end
 end
 
-function Base.mapreduce(f, op, s::TVecOldIterator; kwargs...)
-    result = Folds.mapreduce(op, s.segments; kwargs...) do v
-        mapreduce(f, op, s.fun(v); kwargs...)
+function Base.mapreduce(f, op, t::TVecIterator; kwargs...)
+    result = Folds.mapreduce(op, t.segments, t.executor; kwargs...) do segment
+        mapreduce(f, op, t.selector(segment))
     end
-    # The compiler will know whether it's distributed or not and elide this statement.
-    if is_distributed(s)
-        return MPI.Allreduce(result, op, MPI.COMM_WORLD)
+    return reduce_remote(t.communicator, op, result)
+end
+function Base.map!(f, t::TVecVals)
+    Folds.foreach(t.segments, t.executor) do segment
+        for (k, v) in segment
+            new_val = f(v)
+            if !iszero(new_val)
+                segment[k] = new_val
+            else
+                delete!(segment, k)
+            end
+        end
+    end
+    return t
+end
+function Base.map!(f, dst::TVec, src::TVecVals)
+    if are_compatible(dst, src)
+        Folds.foreach(dst.segments, src.segments, src.executor) do d, s
+            empty!(d)
+            for (k, v) in s
+                new_val = f(v)
+                if !iszero(new_val)
+                    d[k] = new_val
+                end
+            end
+        end
     else
-        return result
-    end
-end
-function Base.map!(f, s::TVecOldIterator{typeof(values)})
-    Folds.foreach(s.segments) do v
-        map!(f, values(v))
-    end
-    return s
-end
-function Base.map!(f, dst::AbstractDVec, src::TVecOldIterator{typeof(values)})
-    @assert length(dst.segments) == length(src.segments)
-    Folds.foreach(zip(dst.segments, src.segments)) do (dst_s, src_s)
-        map!(f, dst_s, values(src_s))
+        empty!(dst)
+        for (k, v) in src
+            dst[k] = f(v)
+        end
     end
     return dst
 end
 
-function Base.:*(α::Number, dv::TVecOld)
-    T = promote_type(typeof(α), valtype(dv))
-    if T == valtype(dv)
-        if iszero(α)
-            result = similar(dv)
+function Base.:*(α::Number, t::TVec)
+    T = promote_type(typeof(α), valtype(t))
+    if T === valtype(t)
+        if !iszero(α)
+            result = copy(t)
+            map!(x -> α * x, values(result))
         else
-            result = copy(dv)
-            map!(x -> α * x, result, values(dv))
+            result = similar(t)
         end
     else
-        result = similar(dv, T)
+        result = similar(t, T)
         if !iszero(α)
-            map!(x -> α * x, result, values(dv))
+            map!(x -> α * x, result, values(t))
         end
     end
     return result
 end
 
-function LinearAlgebra.rmul!(dv::TVecOld, α::Number)
-    map!(x -> x * α, values(dv))
-    return dv
+###
+### High-level linear algebra functions
+###
+function LinearAlgebra.rmul!(t::TVec, α::Number)
+    if iszero(α)
+        empty!(t)
+    else
+        map!(x -> x * α, values(t))
+    end
+    return t
 end
-function LinearAlgebra.mul!(dst::TVecOld, src::TVecOld, α::Number)
+function LinearAlgebra.lmul!(α::Number, t::TVec)
+    if iszero(α)
+        empty!(t)
+    else
+        map!(x -> α * x, values(t))
+    end
+    return t
+end
+function LinearAlgebra.mul!(dst::TVec, src::TVec, α::Number)
     return map!(x -> α * x, dst, values(src))
 end
 
-function LinearAlgebra.axpby!(α, v::TVecOld, β::Number, w::TVecOld)
+function add!(d::Dict, s, α=true)
+    for (key, s_value) in s
+        d_value = get(d, key, zero(valtype(d)))
+        new_value = d_value + α * s_value
+        if iszero(new_value)
+            delete!(d, key)
+        else
+            d[key] = new_value
+        end
+    end
+end
+
+function add!(dst::TVec, src::TVec, α=true)
+    if are_compatible(dst, src)
+        Folds.foreach(dst.segments, src.segments, src.executor) do d, s
+            add!(d, s, α)
+        end
+    else
+        for (k, v) in src
+            deposit!(dst, k, α * v)
+        end
+    end
+    return dst
+end
+function LinearAlgebra.axpby!(α, v::TVec, β::Number, w::TVec)
     rmul!(w, β)
     axpy!(α, v, w)
 end
-function LinearAlgebra.axpy!(α, v::TVecOld, w::TVecOld)
-    Folds.foreach(zip(w.segments, v.segments)) do (w_s, v_s)
-        add!(w_s, v_s, α)
-    end
-    return w
+function LinearAlgebra.axpy!(α, v::TVec, w::TVec)
+    return add!(w, v, α)
 end
-function LinearAlgebra.dot(v::TVecOld, w::TVecOld)
-    # TODO Check for match or fall back to default implementation
-    T = promote_type(valtype(v), valtype(w))
-    result = Folds.sum(zip(v.segments, w.segments)) do (v_s, w_s)
-        dot(v_s, w_s)
-    end::T
-    if is_distributed(v)
-        return MPI.Allreduce(result, +, MPI.COMM_WORLD)
-    else
-        return result
-    end
-end
-function LinearAlgebra.dot(v::AbstractDVec, w::TVecOld)
-    result = invoke(dot, Tuple{AbstractDVec,AbstractDVec}, v, w)
-    if is_distributed(w)
-        return MPI.Allreduce(result, +, MPI.COMM_WORLD)
-    else
-        return result
-    end
-end
-LinearAlgebra.dot(w::TVecOld, v::AbstractDVec) = dot(v, w)
 
-function Base.real(v::TVecOld)
+function LinearAlgebra.dot(left::TVec, right::TVec)
+    if are_compatible(left, right)
+        T = promote_type(valtype(left), valtype(right))
+        result = Folds.sum(zip(left.segments, right.segments), right.executor) do (l_segs, r_segs)
+            sum(r_segs; init=zero(T)) do (k, v)
+                get(l_segs, k, zero(valtype(l_segs))) * v
+            end
+        end::T
+    else
+        result = sum(pairs(right)) do (k, v)
+            left[k] + v
+        end
+    end
+    return reduce_remote(right.communicator, +, result)
+end
+
+function Base.real(v::TVec)
     dst = similar(v, real(valtype(v)))
     map!(real, dst, values(v))
 end
-function Base.imag(v::TVecOld)
+function Base.imag(v::TVec)
     dst = similar(v, real(valtype(v)))
     map!(imag, dst, values(v))
+end
+
+# TODO This must go in Rimu
+function Base.:+(v::AbstractDVec, w::AbstractDVec)
+    result = similar(v, promote_type(valtype(v), valtype(w)))
+    copy!(result, v)
+    add!(result, w)
+    return result
+end
+function Base.:-(v::AbstractDVec, w::AbstractDVec)
+    result = similar(v, promote_type(valtype(v), valtype(w)))
+    copy!(result, v)
+    return axpy!(-one(valtype(result)), w, result)
+end
+
+function LinearAlgebra.normalize!(v::AbstractDVec, p=2)
+    n = norm(v, p)
+    rmul!(v, inv(n))
+    return v
+end
+function LinearAlgebra.normalize(v::AbstractDVec, p=2)
+    res = copy(v)
+    return normalize!(res, p)
+end
+
+function Base.isapprox(v::AbstractDVec, w::AbstractDVec; kwargs...)
+    # Length may be different, but vectors still approximately the same when `atol` is used.
+    left = all(pairs(w)) do (key, val)
+        isapprox(v[key], val; kwargs...)
+    end
+    right = all(pairs(v)) do (key, val)
+        isapprox(w[key], val; kwargs...)
+    end
+    return left && right
 end
