@@ -46,7 +46,7 @@ supports various linear algebra operations such as `norm` and `dot`.
 
 """
 struct TVec{
-    K,V,S,I<:InitiatorRule{V},C<:AbstractCommunicator,E
+    K,V,S,I<:InitiatorRule{V},C<:Communicator,E
 } <: AbstractDVec{K,V}
     segments::Vector{Dict{K,V}}
     style::S
@@ -85,7 +85,7 @@ function TVec{K,V}(
         else
             comm = NotDistributed()
         end
-    elseif communicator isa AbstractCommunicator
+    elseif communicator isa Communicator
         comm = communicator
     else
         throw(ArgumentError("Invalid communicator $communicator"))
@@ -141,9 +141,20 @@ end
 ###
 ### Properties and utilities
 ###
+"""
+    is_distributed(t::TVec)
+
+Return true if `t` is MPI-distributed.
+"""
 is_distributed(t::TVec) = is_distributed(t.communicator)
+
+"""
+    num_segments(t::TVec)
+
+Return the number of segments in `t`.
+"""
 num_segments(t::TVec) = length(t.segments)
-each_segment(t::TVec) = eachindex(t.segments)
+
 StochasticStyle(t::TVec) = t.style
 
 function Base.length(t::TVec)
@@ -153,11 +164,19 @@ end
 
 Base.isempty(t::TVec) = iszero(length(t))
 
+"""
+    are_compatible(t, u)
+
+Return true if `t` and `u` have the same number of segments and show a warning otherwise.
+"""
 function are_compatible(t, u)
     if length(t.segments) == length(u.segments)
         return true
     else
-        @warn "vectors have different numbers of segments. This prevents parallelization." maxlog=1
+        @warn string(
+            "vectors have different numbers of segments. ",
+            "This prevents parallelization.",
+        ) maxlog=1
         return false
     end
 end
@@ -181,10 +200,10 @@ function Base.isequal(t::TVec, u::TVec)
 end
 
 """
-     target_segment(t::TVec, k)
+     target_segment(t::TVec, key) -> target, is_local
 
-Determine the target segment from key hash. For MPI distributed vectors, this may return
-numbers that are out of range.
+Determine the target segment from `key` hash. For MPI distributed vectors, this may return
+numbers that are out of range and `is_local=false`.
 """
 function target_segment(t::TVec{K}, k::K) where {K}
     return target_segment(t.communicator, k, num_segments(t))
@@ -231,6 +250,7 @@ end
 ###
 ### empty(!), similar, copy, etc.
 ###
+# TODO: executor
 function Base.empty(
     t::TVec{K,V}; style=t.style, initiator=t.initiator, communicator=t.communicator,
 ) where {K,V}
@@ -281,6 +301,7 @@ end
 function Base.copy(src::TVec)
     return copy!(empty(src), src)
 end
+
 function Rimu.localpart(t::TVec{K,V,S,I,<:Any,E}) where {K,V,S,I,E}
     return TVec{K,V,S,I,LocalPart,E}(
         t.segments, t.style, t.initiator, LocalPart(t.communicator), t.executor
@@ -290,6 +311,15 @@ end
 ###
 ### Iterators, map, mapreduce
 ###
+"""
+    TVecKeys
+    TVecValues
+    TVecPairs
+
+Iterators over keys/values/pairs of the [`TVec`](@ref). Iteration is only supported over
+the `localpart`. Use reduction operations (`reduce`, `mapreduce`, `sum`, ...) if possible
+when using them.
+"""
 struct TVecIterator{F,S,T,C,E}
     selector::F
     segments::S     # <- TODO: instead of those just store the vector
@@ -359,6 +389,14 @@ function Base.mapreduce(f, op, t::TVecIterator; kwargs...)
     end
     return reduce_remote(t.communicator, op, result)
 end
+
+function Base.all(f, t::TVecIterator; kwargs...)
+    result = Folds.all(t.segments) do segment
+        all(f, t.selector(segment))
+    end
+    return reduce_remote(t.communicator, &, result)
+end
+
 function Base.map!(f, t::TVecVals)
     Folds.foreach(t.segments, t.executor) do segment
         for (k, v) in segment
@@ -390,6 +428,9 @@ function Base.map!(f, dst::TVec, src::TVecVals)
         end
     end
     return dst
+end
+function Base.map(f, t::TVecVals)
+    return map!(f, similar(t.tvec), t) # <- TODO: need to add t.tvec
 end
 
 function Base.:*(α::Number, t::TVec)

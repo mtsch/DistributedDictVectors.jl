@@ -1,7 +1,6 @@
 #TODO DONT NEED DAT
 using Rimu.RMPI
 using Rimu.StochasticStyles: ThresholdCompression, NoCompression
-using FoldsThreads
 
 """
     WorkingMemoryColumn
@@ -50,7 +49,7 @@ operators, such as FCIQMC propagation, operator-vector multiplication and three-
 dot products. #TODO not yet.
 """
 struct WorkingMemory{
-    K,V,W<:AbstractInitiatorValue{V},S,I<:InitiatorRule{V},C<:AbstractCommunicator,E
+    K,V,W<:AbstractInitiatorValue{V},S,I<:InitiatorRule{V},C<:Communicator,E
 }
     columns::Vector{WorkingMemoryColumn{K,V,W,S,I}}
     initiator::I
@@ -88,7 +87,13 @@ function Base.length(w::WorkingMemory)
     return reduce_remote(w.communicator, +, result)
 end
 
-struct MainSegmentIterator{W,D} <: AbstractVector{D} # TODO: rename me
+"""
+    MainSegmentIterator{W,D} <: AbstractVector{D}
+
+Iterates the main segments of a specified rank. See [`remote_segments`](@ref) and
+[`local_segments`](@ref).
+"""
+struct MainSegmentIterator{W,D} <: AbstractVector{D}
     working_memory::W
     rank::Int
 end
@@ -108,10 +113,12 @@ end
 Iterate over the main segments on the current rank. Iterates `Dict`s.
 """
 function local_segments(w::WorkingMemory)
-    rank = rank_id(w.communicator)
+    rank = mpi_rank(w.communicator)
     return MainSegmentIterator{typeof(w),segment_type(eltype(w.columns))}(w, rank)
 end
+
 Base.size(it::MainSegmentIterator) = (num_columns(it.working_memory),)
+
 function Base.getindex(it::MainSegmentIterator, index)
     row_index = index + it.rank * num_columns(it.working_memory)
     return it.working_memory.columns[1].segments[row_index]
@@ -268,7 +275,8 @@ function Rimu.working_memory(::Rimu.NoThreading, t::TVec)
 end
 
 function Rimu.fciqmc_step!(
-    ::Rimu.NoThreading, w::WorkingMemory, ham, src::TVec, shift, dτ
+    ::Rimu.NoThreading,
+    w::WorkingMemory, ham, src::TVec, shift, dτ,
 )
     stat_names, stats = step_stats(StochasticStyle(src))
 
@@ -326,7 +334,8 @@ function equip(operator, t::TVec; warn=true)
     if eltype(operator) === valtype(t)
         wm = WorkingMemory(t)
     else
-        wm = WorkingMemory(similar(t, eltype(operator)))
+@show promote_type(eltype(operator), valtype(t))
+        wm = WorkingMemory(similar(t, promote_type(eltype(operator), valtype(t))))
     end
     if warn && StochasticStyle(t) != IsDeterministic()
         # TODO: this is probably pointless

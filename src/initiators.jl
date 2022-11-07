@@ -1,11 +1,29 @@
 using Rimu.DictVectors: InitiatorRule, Initiator
 
+"""
+    abstract type AbstractInitiatorValue{V}
+
+A value equipped with additional information that enables a variation of the initiator
+approximation.
+
+Must define `Base.zero`, [`from_initiator_value`](@ref) and [`to_initiator_value`](@ref).
+"""
 abstract type AbstractInitiatorValue{V} end
 Base.zero(x::AbstractInitiatorValue) = zero(typeof(x))
 
+"""
+    NoInitiator{V} <: InitiatorRule{V}
+
+Default initiator rule that disables the approximation.
+"""
 struct NoInitiator{V} <: InitiatorRule{V} end
 initiator_valtype(::NoInitiator{V}) where {V} = NonInitiatorValue{V}
 
+"""
+    NonInitiatorValue{V}
+
+Value that does not contain any additional information - used with [`NoInitiator`](@ref).
+"""
 struct NonInitiatorValue{V} <: AbstractInitiatorValue{V}
     value::V
 end
@@ -17,11 +35,24 @@ function Base.:*(α, x::NonInitiatorValue)
 end
 
 Base.zero(::Type{NonInitiatorValue{V}}) where {V} = NonInitiatorValue(zero(V))
-function from_initiator_value(::NoInitiator, x::NonInitiatorValue)
-    return x.value
-end
+
+"""
+    to_initiator_value(::InitiatorRule, k::K, x::V, parent)
+
+Convert `x` to an [`AbstractInitiatorValue`](@ref), taking the initiator rule and the
+`parent` that spawned it into account.
+"""
 function to_initiator_value(::NoInitiator, _, val, _)
     return NonInitiatorValue(val)
+end
+
+"""
+    from_initiator_value(::InitiatorRule, x::AbstractInitiatorValue{V})
+
+Convert the initiator value back to a value of type `V`.
+"""
+function from_initiator_value(::NoInitiator, x::NonInitiatorValue)
+    return x.value
 end
 
 ###
@@ -64,6 +95,7 @@ end
 ###
 ### Compat with old-style initiators
 ###
+# TODO: rename and replace
 struct RimuStyleInitiatorValue{V} <: AbstractInitiatorValue{V}
     safe::V
     unsafe::V

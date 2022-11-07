@@ -2,7 +2,7 @@ module DistributedDictVectors
 
 using Rimu
 using MPI
-using Folds
+using Folds, FoldsThreads
 using KrylovKit
 using LinearAlgebra
 

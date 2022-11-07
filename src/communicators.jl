@@ -1,3 +1,5 @@
+import Rimu.RMPI: mpi_size, mpi_rank, mpi_comm
+
 struct CommunicatorError <: Exception
     msg::String
 end
@@ -8,42 +10,123 @@ function Base.showerror(io::IO, ex::CommunicatorError)
 end
 
 """
+    abstract type Communicator
 
 When implementing a communicator, use [`local_segments`](@ref) and
 [`remote_segments`](@ref).
-"""
-abstract type AbstractCommunicator end
-is_distributed(::AbstractCommunicator) = true
-rank_id(c::AbstractCommunicator) = c.mpi_rank
-reduce_remote(c::AbstractCommunicator, op, x) = MPI.Allreduce(x, op, c.mpi_comm)
-total_num_segments(c::AbstractCommunicator, n) = n * c.mpi_size
 
-function target_segment(c::AbstractCommunicator, k, num_segments)
-    total_segments = num_segments * c.mpi_size
-    result = fastrange_hash(k, total_segments) - c.mpi_rank * num_segments
+# Interface
+
+* [`synchronize_remote!`](@ref)
+* [`mpi_rank`](@ref)
+* [`mpi_size`](@ref)
+* [`mpi_comm`](@ref)
+
+# Optional interface
+
+* [`is_distributed`](@ref): defaults to returning `true`.
+* [`reduce_remote`](@ref): defaults to using `MPI.Allreduce`.
+* [`total_num_segments`](@ref): defaults to `n * mpi_size`.
+* [`target_segment`](@ref): defaults to selecting using fastrange to pick the segment.
+
+"""
+abstract type Communicator end
+
+"""
+    is_distributed(::Communicator)
+
+Return `true` if communicator operates over MPI.
+"""
+is_distributed(::Communicator) = true
+
+"""
+    reduce_remote(c::Communicator, op, x)
+
+Perform a reduction over MPI, by using `MPI.Allreduce`.
+"""
+reduce_remote(c::Communicator, op, x) = MPI.Allreduce(x, op, mpi_comm(c))
+
+"""
+    total_num_segments(c::Communicator, n) -> Int
+
+Return the total number of segments, including the remote ones, where `n` is number of
+local segments.
+"""
+total_num_segments(c::Communicator, n) = n * mpi_size(c)
+
+"""
+    target_segment(c::Communicator, k, num_segments) -> target, is_local
+
+Return the target segment for a key if it's local key and whether it's local or not.
+"""
+function target_segment(c::Communicator, k, num_segments)
+    total_segments = num_segments * mpi_size(c)
+    result = fastrange_hash(k, total_segments) - mpi_rank(c) * num_segments
     return result, 1 ≤ result ≤ num_segments
 end
 
-struct NotDistributed <: AbstractCommunicator end
+"""
+    mpi_rank(::Communicator) -> Int
+
+Return the MPI rank of the communicator.
+"""
+mpi_rank
+
+"""
+    mpi_size(::Communicator) -> Int
+
+Return the total number of MPI ranks.
+"""
+mpi_size
+
+"""
+    mpi_comm(::Communicator) -> MPI.Comm
+
+Return the `MPI.Comm` that the communicator operates on.
+"""
+mpi_comm
+
+"""
+    NotDistributed <: Communicator
+
+This [`Communicator`](@ref) is used when MPI is not available.
+"""
+struct NotDistributed <: Communicator end
+
 is_distributed(::NotDistributed) = false
-rank_id(::NotDistributed) = 0
+
+mpi_rank(::NotDistributed) = 0
+mpi_size(::NotDistributed) = 1
+
 synchronize_remote!(::NotDistributed, w) = w
+
 reduce_remote(::NotDistributed, _, x) = x
+
 total_num_segments(::NotDistributed, n) = n
+
 target_segment(::NotDistributed, k, num_segments) = fastrange_hash(k, num_segments), true
 
-struct LocalPart{C} <: AbstractCommunicator
+"""
+    LocalPart <: Communicator
+
+When [`localpart`](@ref) is used, the vector's [`Communicator`](@ref) is replaced with this.
+This allows iteration and local reductions.
+"""
+struct LocalPart{C} <: Communicator
     communicator::C
 end
+
 is_distributed(::LocalPart) = false
+
 function synchronize_remote!(::LocalPart, w)
     throw(CommunicatorError("attemted to synchronize localpart"))
 end
+
 reduce_remote(::LocalPart, _, x) = x
 
 function target_segment(c::LocalPart, k, num_segments)
-    total_segments = num_segments * c.mpi_size
-    result = fastrange_hash(k, total_segments) - c.mpi_rank * num_segments
+    total_segments = num_segments * mpi_size(c)
+    result = fastrange_hash(k, total_segments) - mpi_rank(c) * num_segments
     if 1 ≤ result ≤ num_segments
         return result, true
     else
@@ -51,10 +134,12 @@ function target_segment(c::LocalPart, k, num_segments)
     end
 end
 
-###
-### Utils
-###
 """
+    SegmentedBuffer
+
+Multiple vectors stored in a simple buffer with MPI communication.
+
+See [`insert_collections!`](@ref), [`mpi_send`](@ref), [`mpi_recv!`](@ref).
 """
 struct SegmentedBuffer{T} <: AbstractVector{SubArray{Float64,1,Vector{T},Tuple{UnitRange{Int64}},true}}
     offsets::Vector{Int}
@@ -65,11 +150,18 @@ function SegmentedBuffer{T}() where {T}
 end
 
 Base.size(buf::SegmentedBuffer) = size(buf.offsets)
+
 function Base.getindex(buf::SegmentedBuffer, i)
     start_index = get(buf.offsets, i-1, 0) + 1
     end_index = buf.offsets[i]
     return view(buf.buffer, start_index:end_index)
 end
+
+"""
+    insert_collections!(buf::SegmentedBuffer, iters, ex=ThreadedEx())
+
+Insert collections in `iters` into buffers.
+"""
 function insert_collections!(buf::SegmentedBuffer, iters, ex=ThreadedEx())
     resize!(buf.offsets, length(iters))
     resize!(buf.buffer, sum(length, iters))
@@ -89,11 +181,23 @@ function insert_collections!(buf::SegmentedBuffer, iters, ex=ThreadedEx())
     end
     return buf
 end
+
+"""
+    mpi_send(buf::SegmentedBuffer, dest, comm)
+
+Send the buffers to `dest`.
+"""
 function mpi_send(buf::SegmentedBuffer, dest, comm)
     MPI.Isend(buf.offsets, comm; dest, tag=0)
     MPI.Isend(buf.buffer, comm; dest, tag=1)
     return buf
 end
+
+"""
+    mpi_recv!(buf::SegmentedBuffer, dest, comm)
+
+Receive the buffers from `source`.
+"""
 function mpi_recv!(buf::SegmentedBuffer, source, comm)
     offset_status = MPI.Probe(source, 0, comm)
     resize!(buf.offsets, MPI.Get_count(offset_status, Int))
@@ -104,10 +208,12 @@ function mpi_recv!(buf::SegmentedBuffer, source, comm)
     return buf
 end
 
-###
-### Point to point communication
-###
-struct PointToPoint{K,V} <: AbstractCommunicator
+"""
+    PointToPoint <: Communicator
+
+[`Communicator`](@ref) that uses circular communication using `MPI.Isend` and `MPI.Recv!`.
+"""
+struct PointToPoint{K,V} <: Communicator
     send_buffer::SegmentedBuffer{Pair{K,V}}
     recv_buffer::SegmentedBuffer{Pair{K,V}}
     mpi_comm::MPI.Comm
@@ -128,6 +234,10 @@ function PointToPoint{K,V}(
         MPI.Comm_size(mpi_comm),
     )
 end
+
+mpi_rank(ptp::PointToPoint) = ptp.mpi_rank
+mpi_size(ptp::PointToPoint) = ptp.mpi_size
+mpi_comm(ptp::PointToPoint) = ptp.mpi_comm
 
 function synchronize_remote!(ptp::PointToPoint, w)
     for offset in 1:ptp.mpi_size - 1
