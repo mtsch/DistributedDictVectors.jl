@@ -1,3 +1,12 @@
+struct CommunicatorError <: Exception
+    msg::String
+end
+CommunicatorError(args...) = CommunicatorError(string(args...))
+
+function Base.showerror(io::IO, ex::CommunicatorError)
+    print(io, "CommunicatorError: ", ex.msg)
+end
+
 """
 
 When implementing a communicator, use [`local_segments`](@ref) and
@@ -9,13 +18,11 @@ rank_id(c::AbstractCommunicator) = c.mpi_rank
 reduce_remote(c::AbstractCommunicator, op, x) = MPI.Allreduce(x, op, c.mpi_comm)
 total_num_segments(c::AbstractCommunicator, n) = n * c.mpi_size
 
-function target_segment(c::AbstractCommunicator, h::UInt64, num_segments)
+function target_segment(c::AbstractCommunicator, k, num_segments)
     total_segments = num_segments * c.mpi_size
-    result = fastrange(h, total_segments) - c.mpi_rank * num_segments
+    result = fastrange_hash(k, total_segments) - c.mpi_rank * num_segments
     return result, 1 ≤ result ≤ num_segments
 end
-
-diagonal_segment(c::AbstractCommunicator, n, index) = mod1(index, n), index
 
 struct NotDistributed <: AbstractCommunicator end
 is_distributed(::NotDistributed) = false
@@ -23,8 +30,26 @@ rank_id(::NotDistributed) = 0
 synchronize_remote!(::NotDistributed, w) = w
 reduce_remote(::NotDistributed, _, x) = x
 total_num_segments(::NotDistributed, n) = n
-target_segment(::NotDistributed, h::UInt64, num_segments) = fastrange(h, num_segments), true
-diagonal_segment(::NotDistributed, _, index) = (index, index)
+target_segment(::NotDistributed, k, num_segments) = fastrange_hash(k, num_segments), true
+
+struct LocalPart{C} <: AbstractCommunicator
+    communicator::C
+end
+is_distributed(::LocalPart) = false
+function synchronize_remote!(::LocalPart, w)
+    throw(CommunicatorError("attemted to synchronize localpart"))
+end
+reduce_remote(::LocalPart, _, x) = x
+
+function target_segment(c::LocalPart, k, num_segments)
+    total_segments = num_segments * c.mpi_size
+    result = fastrange_hash(k, total_segments) - c.mpi_rank * num_segments
+    if 1 ≤ result ≤ num_segments
+        return result, true
+    else
+        throw(CommunicatorError("attempted to access non-local key $k"))
+    end
+end
 
 ###
 ### Utils
@@ -45,7 +70,7 @@ function Base.getindex(buf::SegmentedBuffer, i)
     end_index = buf.offsets[i]
     return view(buf.buffer, start_index:end_index)
 end
-function insert_collections!(buf::SegmentedBuffer, iters)
+function insert_collections!(buf::SegmentedBuffer, iters, ex=ThreadedEx())
     resize!(buf.offsets, length(iters))
     resize!(buf.buffer, sum(length, iters))
 
@@ -57,7 +82,7 @@ function insert_collections!(buf::SegmentedBuffer, iters)
     end
 
     # Copy over the data
-    Folds.foreach(zip(buf, iters)) do (dst, src)
+    Folds.foreach(zip(buf, iters), ex) do (dst, src)
         for (i, x) in enumerate(src)
             dst[i] = x
         end
@@ -109,11 +134,11 @@ function synchronize_remote!(ptp::PointToPoint, w)
         dst_rank = mod(ptp.mpi_rank + offset, ptp.mpi_size)
         src_rank = mod(ptp.mpi_rank - offset, ptp.mpi_size)
 
-        insert_collections!(ptp.send_buffer, remote_segments(w, dst_rank))
+        insert_collections!(ptp.send_buffer, remote_segments(w, dst_rank), w.executor)
         mpi_send(ptp.send_buffer, dst_rank, ptp.mpi_comm)
         mpi_recv!(ptp.recv_buffer, src_rank, ptp.mpi_comm)
 
-        Folds.foreach(zip(local_segments(w), ptp.recv_buffer)) do (dst, src)
+        Folds.foreach(zip(local_segments(w), ptp.recv_buffer), w.executor) do (dst, src)
             add!(dst, src)
         end
     end

@@ -2,26 +2,65 @@ import Rimu: StochasticStyle, deposit!, add!
 using Folds
 
 """
-    fastrange(h, n)
+    fastrange_hash(k, n)
 
-Map hash to to bucket in range 1:n. See [fastrange](https://github.com/lemire/fastrange).
+Map `k` to to bucket in range 1:n. See [fastrange](https://github.com/lemire/fastrange).
 """
-fastrange(h, n::Int) = (((h % UInt128) * (n % UInt128)) >> 64) % Int + 1
+function fastrange_hash(k, n::Int)
+    h = hash(k)
+    return (((h % UInt128) * (n % UInt128)) >> 64) % Int + 1
+end
 
-struct TVec{K,V,S,I<:InitiatorRule{V},C<:AbstractCommunicator} <: AbstractDVec{K,V}
+"""
+    TVec{K,V}(; kwargs...)
+    TVec(iter; kwargs...)
+    TVec(pairs...; kwargs...)
+
+Dictionary-based vector-like data structure for use with FCIQMC and
+[KrylovKit.jl](https://github.com/Jutho/KrylovKit.jl). While mostly behaving like a Dict, it
+supports various linear algebra operations such as `norm` and `dot`.
+
+# Keyword arguments
+
+* `style = `[`default_style`](@ref)`(V)`: A [`StochasticStyle`](@ref) that is used to select
+  the spawning startegy in the FCIQMC algorithm.
+
+* `initiator = `[`NoInitiator`](@ref)`()`: An [`InitiatorRule`](@ref), used in FCIQMC to
+  remove the sign problem.
+
+* `communicator`: A [`Communicator`](@ref) that controls how operations are performed when
+  using MPI. The defaults are [`NotDistributed`](@ref) when not using MPI and
+  [`PointToPoint`](@ref) when using MPI.
+
+* `num_segments = Threads.nthreads()`: Number of segments to divide the vector into. This is
+  best left at its default value. See the extended help for more info.
+
+* `executor = Folds.ThreadedEx()`: Experimental. Change the executor to use. See
+  [FoldsThreads.jl](https://juliafolds.github.io/FoldsThreads.jl/dev/) for more info on
+  executors.
+
+# Extended Help
+
+* Explain why/how it is segmented
+* Explain iteration / reductions / localpart
+
+"""
+struct TVec{
+    K,V,S,I<:InitiatorRule{V},C<:AbstractCommunicator,E
+} <: AbstractDVec{K,V}
     segments::Vector{Dict{K,V}}
     style::S
     initiator::I
     communicator::C
+    executor::E
 end
 
 function TVec{K,V}(
     ; style=default_style(V), num_segments=Threads.nthreads(),
     initiator=false, initiator_threshold=1,
     communicator=nothing,
+    executor=nothing,
 ) where{K,V}
-    comm = MPI.COMM_WORLD
-
     segments = [Dict{K,V}() for _ in 1:num_segments]
 
     if initiator == false
@@ -52,7 +91,17 @@ function TVec{K,V}(
         throw(ArgumentError("Invalid communicator $communicator"))
     end
 
-    return TVec(segments, style, irule, comm)
+    if isnothing(executor)
+        if Threads.nthreads() == 1 || num_segments == 1
+            ex = NonThreadedEx()
+        else
+            ex = ThreadedEx()
+        end
+    else
+        ex = executor
+    end
+
+    return TVec(segments, style, irule, comm, ex)
 end
 function TVec(pairs; kwargs...)
     keys = getindex.(pairs, 1) # to get eltypes
@@ -65,6 +114,28 @@ function TVec(pairs; kwargs...)
 end
 function TVec(pairs::Vararg{Pair}; kwargs...)
     return TVec(pairs; kwargs...)
+end
+
+function Base.summary(io::IO, t::TVec)
+    len = length(t)
+    print(io, "$len-element")
+    if num_segments(t) ≠ Threads.nthreads()
+        print(io, ", ", num_segments(t), "-segment")
+    end
+    if t.communicator isa LocalPart
+        print(io, " localpart(TVec): ")
+        comm = t.communicator.communicator
+    else
+        print(io, " TVec: ")
+        comm = t.communicator
+    end
+    print(io, "style = ", t.style)
+    if t.initiator ≠ NoInitiator{valtype(t)}()
+        print(io, ", initiator=", t.initiator)
+    end
+    if comm ≠ NotDistributed()
+        print(io, ", communicator=", t.communicator)
+    end
 end
 
 ###
@@ -93,11 +164,11 @@ end
 
 function Base.isequal(t::TVec, u::TVec)
     if are_compatible(t, u)
-        result = Folds.all(zip(t.segments, u.segments)) do (t_seg, u_seg)
+        result = Folds.all(zip(t.segments, u.segments), u.executor) do (t_seg, u_seg)
             isequal(t_seg, u_seg)
         end
     elseif length(t) == length(u)
-        result = Folds.all(u.segments) do seg
+        result = Folds.all(u.segments, u.executor) do seg
             for (k, v) in seg
                 isequal(t[k], v) || return false
             end
@@ -116,7 +187,7 @@ Determine the target segment from key hash. For MPI distributed vectors, this ma
 numbers that are out of range.
 """
 function target_segment(t::TVec{K}, k::K) where {K}
-    return target_segment(t.communicator, hash(k), num_segments(t))
+    return target_segment(t.communicator, k, num_segments(t))
 end
 
 ###
@@ -143,6 +214,7 @@ function Base.setindex!(t::TVec{K,V}, val, k::K) where {K,V}
     return v
 end
 function deposit!(t::TVec{K,V}, k::K, val, parent=nothing) where {K,V}
+    iszero(val) && return nothing
     segment_id, is_local = target_segment(t, k)
     if is_local
         segment = t.segments[segment_id]
@@ -179,19 +251,19 @@ end
 Base.similar(t::TVec, args...; kwargs...) = empty(t, args...; kwargs...)
 
 function Base.empty!(t::TVec)
-    Folds.foreach(empty!, t.segments)
+    Folds.foreach(empty!, t.segments, t.executor)
     return t
 end
 
 function Base.sizehint!(t::TVec, n)
     n_per_segment = cld(n, length(t.segments))
-    Folds.foreach(d -> sizehint!(d, n_per_segment), t.segments)
+    Folds.foreach(d -> sizehint!(d, n_per_segment), t.segments, t.executor)
     return t
 end
 
 function Base.copyto!(dst::TVec, src::TVec)
     if are_compatible(dst, src)
-        Folds.foreach(zip(dst.segments, src.segments)) do (d_seg, s_seg)
+        Folds.foreach(dst.segments, src.segments, src.executor) do d_seg, s_seg
             copy!(d_seg, s_seg)
         end
         return dst
@@ -209,18 +281,27 @@ end
 function Base.copy(src::TVec)
     return copy!(empty(src), src)
 end
+function Rimu.localpart(t::TVec{K,V,S,I,<:Any,E}) where {K,V,S,I,E}
+    return TVec{K,V,S,I,LocalPart,E}(
+        t.segments, t.style, t.initiator, LocalPart(t.communicator), t.executor
+    )
+end
 
 ###
 ### Iterators, map, mapreduce
 ###
-struct TVecIterator{F,S,T,C}
+struct TVecIterator{F,S,T,C,E}
     selector::F
-    segments::S
+    segments::S     # <- TODO: instead of those just store the vector
     communicator::C
+    executor::E
 
     function TVecIterator(selector::F, ::Type{T}, t::TVec) where {F,T}
         C = typeof(t.communicator)
-        return new{F,typeof(t.segments),T,C}(selector, t.segments, t.communicator)
+        E = typeof(t.executor)
+        return new{F,typeof(t.segments),T,C,E}(
+            selector, t.segments, t.communicator, t.executor
+        )
     end
 end
 
@@ -240,10 +321,19 @@ Base.keys(t::TVec) = TVecIterator(keys, keytype(t), t)
 Base.values(t::TVec) = TVecIterator(values, valtype(t), t)
 Base.pairs(t::TVec) = TVecIterator(pairs, eltype(t), t)
 
-function Base.iterate(t::TVecIterator, segment_id::Int=1)
-    if is_distributed(t)
-        @warn "Vector is distributed, iterating over local entries only."
+function Base.iterate(t::TVecIterator)
+    if t.communicator isa NotDistributed
+        # TODO: this may be a bit annoying.
+        @warn "iteration is not supported. Please use `localpart`."
+    elseif !(t.communicator isa LocalPart)
+        throw(CommunicatorError(
+            "iteration over distributed vectors is not supported.",
+            "Use `localpart` to iterate over the local part only."
+        ))
     end
+    return iterate(t, 1)
+end
+function Base.iterate(t::TVecIterator, segment_id::Int)
     if segment_id > length(t.segments)
         return nothing
     end
@@ -264,13 +354,13 @@ function Base.iterate(t::TVecIterator, (segment_id, state))
 end
 
 function Base.mapreduce(f, op, t::TVecIterator; kwargs...)
-    result = Folds.mapreduce(op, t.segments; kwargs...) do segment
+    result = Folds.mapreduce(op, t.segments, t.executor; kwargs...) do segment
         mapreduce(f, op, t.selector(segment))
     end
     return reduce_remote(t.communicator, op, result)
 end
 function Base.map!(f, t::TVecVals)
-    Folds.foreach(t.segments) do segment
+    Folds.foreach(t.segments, t.executor) do segment
         for (k, v) in segment
             new_val = f(v)
             if !iszero(new_val)
@@ -284,7 +374,7 @@ function Base.map!(f, t::TVecVals)
 end
 function Base.map!(f, dst::TVec, src::TVecVals)
     if are_compatible(dst, src)
-        Folds.foreach(zip(dst.segments, src.segments)) do (d, s)
+        Folds.foreach(dst.segments, src.segments, src.executor) do d, s
             empty!(d)
             for (k, v) in s
                 new_val = f(v)
@@ -357,7 +447,7 @@ end
 
 function add!(dst::TVec, src::TVec, α=true)
     if are_compatible(dst, src)
-        Folds.foreach(zip(dst.segments, src.segments)) do (d, s)
+        Folds.foreach(dst.segments, src.segments, src.executor) do d, s
             add!(d, s, α)
         end
     else
@@ -378,7 +468,7 @@ end
 function LinearAlgebra.dot(left::TVec, right::TVec)
     if are_compatible(left, right)
         T = promote_type(valtype(left), valtype(right))
-        result = Folds.sum(zip(left.segments, right.segments)) do (l_segs, r_segs)
+        result = Folds.sum(zip(left.segments, right.segments), right.executor) do (l_segs, r_segs)
             sum(r_segs; init=zero(T)) do (k, v)
                 get(l_segs, k, zero(valtype(l_segs))) * v
             end
@@ -424,6 +514,7 @@ function LinearAlgebra.normalize(v::AbstractDVec, p=2)
 end
 
 function Base.isapprox(v::AbstractDVec, w::AbstractDVec; kwargs...)
+    # Length may be different, but vectors still approximately the same when `atol` is used.
     left = all(pairs(w)) do (key, val)
         isapprox(v[key], val; kwargs...)
     end
