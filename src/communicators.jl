@@ -82,7 +82,7 @@ function insert_collections!(buf::SegmentedBuffer, iters, ex=ThreadedEx())
     end
 
     # Copy over the data
-    Folds.foreach(zip(buf, iters), ex) do (dst, src)
+    Folds.foreach(buf, iters, ex) do dst, src
         for (i, x) in enumerate(src)
             dst[i] = x
         end
@@ -138,7 +138,7 @@ function synchronize_remote!(ptp::PointToPoint, w)
         mpi_send(ptp.send_buffer, dst_rank, ptp.mpi_comm)
         mpi_recv!(ptp.recv_buffer, src_rank, ptp.mpi_comm)
 
-        Folds.foreach(zip(local_segments(w), ptp.recv_buffer), w.executor) do (dst, src)
+        Folds.foreach(local_segments(w), ptp.recv_buffer, w.executor) do dst, src
             add!(dst, src)
         end
     end
