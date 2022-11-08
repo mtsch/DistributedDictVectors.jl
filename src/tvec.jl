@@ -384,13 +384,15 @@ function Base.iterate(t::TVecIterator, (segment_id, state))
 end
 
 function Base.mapreduce(f, op, t::TVecIterator; kwargs...)
-    result = Folds.mapreduce(op, t.segments, t.executor; kwargs...) do segment
-        mapreduce(f, op, t.selector(segment))
+    result = Folds.mapreduce(
+        op, Iterators.filter(!isempty, t.segments), t.executor; kwargs...
+    ) do segment
+        mapreduce(f, op, t.selector(segment); kwargs...)
     end
     return reduce_remote(t.communicator, op, result)
 end
 
-function Base.all(f, t::TVecIterator; kwargs...)
+function Base.all(f, t::TVecIterator)
     result = Folds.all(t.segments) do segment
         all(f, t.selector(segment))
     end
@@ -438,14 +440,14 @@ function Base.:*(α::Number, t::TVec)
     if T === valtype(t)
         if !iszero(α)
             result = copy(t)
-            map!(x -> α * x, values(result))
+            map!(Base.Fix1(*, α), values(result))
         else
             result = similar(t)
         end
     else
         result = similar(t, T)
         if !iszero(α)
-            map!(x -> α * x, result, values(t))
+            map!(Base.Fix1(*, α), result, values(t))
         end
     end
     return result
@@ -458,7 +460,7 @@ function LinearAlgebra.rmul!(t::TVec, α::Number)
     if iszero(α)
         empty!(t)
     else
-        map!(x -> x * α, values(t))
+        map!(Base.Fix2(*, α), values(t))
     end
     return t
 end
@@ -466,12 +468,12 @@ function LinearAlgebra.lmul!(α::Number, t::TVec)
     if iszero(α)
         empty!(t)
     else
-        map!(x -> α * x, values(t))
+        map!(Base.Fix1(*, α), values(t))
     end
     return t
 end
 function LinearAlgebra.mul!(dst::TVec, src::TVec, α::Number)
-    return map!(x -> α * x, dst, values(src))
+    return map!(Base.Fix1(*, α), dst, values(src))
 end
 
 function add!(d::Dict, s, α=true)

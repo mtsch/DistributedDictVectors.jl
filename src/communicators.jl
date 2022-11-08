@@ -166,7 +166,7 @@ function insert_collections!(buf::SegmentedBuffer, iters, ex=ThreadedEx())
     resize!(buf.offsets, length(iters))
     resize!(buf.buffer, sum(length, iters))
 
-    # Get the lengths
+    # Compute offsets
     curr = 0
     for (i, col) in enumerate(iters)
         curr += length(col)
@@ -202,6 +202,18 @@ function mpi_recv!(buf::SegmentedBuffer, source, comm)
     offset_status = MPI.Probe(source, 0, comm)
     resize!(buf.offsets, MPI.Get_count(offset_status, Int))
     MPI.Recv!(buf.offsets, comm; source, tag=0)
+
+    #####
+    n_to_get = MPI.Get_count(MPI.Probe(source, 1, comm), eltype(buf))
+    if last(buf.offsets) ≠ n_to_get
+        @show last(buf.offsets)
+        @show n_to_get
+        resize!(buf.buffer, n_to_get)
+        MPI.Recv!(buf.buffer, comm; source, tag=1)
+        display(buf.buffer)
+        error("fial")
+    end
+    #####
 
     resize!(buf.buffer, last(buf.offsets))
     MPI.Recv!(buf.buffer, comm; source, tag=1)
