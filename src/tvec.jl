@@ -250,7 +250,8 @@ end
 ###
 ### empty(!), similar, copy, etc.
 ###
-# TODO: executor
+# TODO: executorm this does not work with changing eltypes. Must fix the initiator,
+# executor, and communicator.
 function Base.empty(
     t::TVec{K,V}; style=t.style, initiator=t.initiator, communicator=t.communicator,
 ) where {K,V}
@@ -397,6 +398,18 @@ function Base.all(f, t::TVecIterator)
         all(f, t.selector(segment))
     end
     return reduce_remote(t.communicator, &, result)
+end
+
+function LinearAlgebra.norm(x::TVec, p::Real=2)
+    if p === 1
+        return float(sum(abs, values(x), init=real(zero(valtype(x)))))
+    elseif p === 2
+        return sqrt(sum(abs2, values(x), init=real(zero(valtype(x)))))
+    elseif p === Inf
+        return float(mapreduce(abs, max, values(x), init=real(zero(valtype(x)))))
+    else
+        error("$p-norm of $(typeof(x)) is not implemented.")
+    end
 end
 
 function Base.map!(f, t::TVecVals)

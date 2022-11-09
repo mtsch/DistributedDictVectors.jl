@@ -141,7 +141,7 @@ Multiple vectors stored in a simple buffer with MPI communication.
 
 See [`insert_collections!`](@ref), [`mpi_send`](@ref), [`mpi_recv!`](@ref).
 """
-struct SegmentedBuffer{T} <: AbstractVector{SubArray{Float64,1,Vector{T},Tuple{UnitRange{Int64}},true}}
+struct SegmentedBuffer{T} <: AbstractVector{SubArray{T,1,Vector{T},Tuple{UnitRange{Int64}},true}}
     offsets::Vector{Int}
     buffer::Vector{T}
 end
@@ -203,20 +203,23 @@ function mpi_recv!(buf::SegmentedBuffer, source, comm)
     resize!(buf.offsets, MPI.Get_count(offset_status, Int))
     MPI.Recv!(buf.offsets, comm; source, tag=0)
 
-    #####
-    n_to_get = MPI.Get_count(MPI.Probe(source, 1, comm), eltype(buf))
-    if last(buf.offsets) ≠ n_to_get
-        @show last(buf.offsets)
-        @show n_to_get
-        resize!(buf.buffer, n_to_get)
-        MPI.Recv!(buf.buffer, comm; source, tag=1)
-        display(buf.buffer)
-        error("fial")
-    end
-    #####
+    # Done for checking only
+    buffer_status = MPI.Probe(source, 1, comm)
+    buffer_length = MPI.Get_count(buffer_status, eltype(eltype(buf)))
 
-    resize!(buf.buffer, last(buf.offsets))
+    resize!(buf.buffer, buffer_length)
     MPI.Recv!(buf.buffer, comm; source, tag=1)
+
+    # TODO: reproduce, fix and remove
+    if buffer_length != last(buf.offsets)
+        error(
+            "Something went wrong.\n       ",
+            "buffer_length: ", buffer_length, "\n       ",
+            "last(buf.offsets): ", last(buf.offsets), "\n       ",
+            buf.buffer,
+        )
+    end
+
     return buf
 end
 
